@@ -188,7 +188,16 @@ Built-in tokenizers:
 4. Fallbacks are resolved greedily after the threshold is set
 5. Output is ordered by sequence, not priority
 
-This is inspired by [Priompt](https://github.com/anysphere/priompt) (Cursor's prompt composition system), adapted for Elixir's data-driven style.
+## Inspirations
+
+Winnow draws from several systems and ideas in the prompt engineering ecosystem:
+
+- **[Priompt](https://github.com/anysphere/priompt)** (Anysphere/Cursor) — the priority-based threshold algorithm, binary search for budget fitting, and fallback mechanism that form Winnow's core render pipeline
+- **Anthropic's prompt engineering patterns** — the 4-block prompt structure (Instructions, Context, Task, Output Format) informed how priorities map to prompt sections
+- **[vscode-prompt-tsx](https://github.com/nicklascschmidt/vscode-prompt-tsx)** (Microsoft) — priority-based pruning in VS Code Copilot validated this approach for production use
+- **[LangChain](https://github.com/langchain-ai/langchain)** — memory management categories (buffer/summary/hybrid) informed what Winnow deliberately does *not* handle: content generation and summarization live upstream
+
+Adapted for Elixir's data-driven style — structs and pure functions instead of JSX or class hierarchies.
 
 ## License
 

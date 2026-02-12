@@ -23,6 +23,8 @@ defmodule Winnow.ContentPiece do
   - `type` — `:text`, `:image`, `:tool_def`, or `:file` (default `:text`)
   - `condition` — zero-arity function; piece excluded if it returns `false`
   - `overflow` — `:error`, `:truncate_end`, or `:truncate_middle` (default `:error`)
+  - `name` — optional identifier (e.g. for reservations)
+  - `metadata` — optional arbitrary data (e.g. original tool map)
   """
 
   @type t :: %__MODULE__{
@@ -36,7 +38,9 @@ defmodule Winnow.ContentPiece do
           cacheable: boolean(),
           type: :text | :image | :tool_def | :file,
           condition: (-> boolean()) | nil,
-          overflow: :error | :truncate_end | :truncate_middle
+          overflow: :error | :truncate_end | :truncate_middle,
+          name: atom() | nil,
+          metadata: term()
         }
 
   @enforce_keys [:role, :content, :priority, :sequence]
@@ -48,6 +52,8 @@ defmodule Winnow.ContentPiece do
     :token_count,
     :section,
     :condition,
+    :name,
+    :metadata,
     fallbacks: [],
     cacheable: false,
     type: :text,

@@ -141,7 +141,7 @@ defmodule Winnow do
       content = tool_content(tool)
 
       piece_opts =
-        [priority: priority, content: content, type: :tool_def]
+        [priority: priority, content: content, type: :tool_def, metadata: tool]
         |> Keyword.merge(base_opts)
 
       add(acc, :system, piece_opts)
@@ -160,13 +160,14 @@ defmodule Winnow do
   - `tokens` (required) — number of tokens to reserve
   """
   @spec reserve(t(), atom(), keyword()) :: t()
-  def reserve(%__MODULE__{} = winnow, _name, opts) do
+  def reserve(%__MODULE__{} = winnow, name, opts) do
     tokens = Keyword.fetch!(opts, :tokens)
 
     add(winnow, :system,
       priority: :infinity,
       content: "",
-      token_count: tokens
+      token_count: tokens,
+      name: name
     )
   end
 

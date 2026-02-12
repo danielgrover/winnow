@@ -186,6 +186,17 @@ defmodule WinnowTest do
       [piece] = w.pieces
       assert piece.content == "foo: does foo"
     end
+
+    test "stores original tool map in metadata" do
+      tool = %{name: "search", description: "Search the web", parameters: %{}}
+
+      w =
+        Winnow.new(budget: 4000)
+        |> Winnow.add_tools([tool], priority: 750)
+
+      [piece] = w.pieces
+      assert piece.metadata == tool
+    end
   end
 
   describe "reserve/3" do
@@ -198,6 +209,15 @@ defmodule WinnowTest do
       assert piece.content == ""
       assert piece.token_count == 500
       assert piece.priority == :infinity
+    end
+
+    test "stores name on the piece" do
+      w =
+        Winnow.new(budget: 4000)
+        |> Winnow.reserve(:response, tokens: 500)
+
+      [piece] = w.pieces
+      assert piece.name == :response
     end
   end
 

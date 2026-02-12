@@ -663,6 +663,110 @@ defmodule Winnow.RendererTest do
     end
   end
 
+  describe "render/1 — tools" do
+    test "RenderResult.tools contains tool maps for included tools" do
+      tools = [
+        %{name: "search", description: "Search the web"},
+        %{name: "weather", description: "Get weather"}
+      ]
+
+      result =
+        Winnow.new(budget: 1000)
+        |> Winnow.add_tools(tools, priority: 750)
+        |> Winnow.render()
+
+      assert length(result.tools) == 2
+      names = Enum.map(result.tools, & &1.name)
+      assert "search" in names
+      assert "weather" in names
+    end
+
+    test "dropped tools excluded from RenderResult.tools" do
+      tools = [
+        %{name: "search", description: "Search the web"},
+        %{name: "weather", description: "Get weather"}
+      ]
+
+      result =
+        Winnow.new(budget: 15)
+        |> Winnow.add(:system, priority: 1000, content: "System", token_count: 10)
+        |> Winnow.add_tools(tools, priority: 100)
+        |> Winnow.render()
+
+      # Budget too tight for tools at low priority — they get dropped
+      assert result.tools == []
+    end
+
+    test "empty when no tools added" do
+      result =
+        Winnow.new(budget: 100)
+        |> Winnow.add(:user, priority: 500, content: "Hello", token_count: 5)
+        |> Winnow.render()
+
+      assert result.tools == []
+    end
+  end
+
+  describe "render/1 — truncation uses tokenizer overhead" do
+    defmodule LowOverheadTokenizer do
+      @behaviour Winnow.Tokenizer
+
+      @impl true
+      def count_tokens(text), do: div(byte_size(text), 4)
+
+      @impl true
+      def message_overhead, do: 2
+    end
+
+    test "truncation uses tokenizer overhead, not hardcoded 4" do
+      # With overhead=2 and budget=12, available for content = 12-2 = 10 tokens = 40 bytes
+      # With hardcoded overhead=4, available would be 12-4 = 8 tokens = 32 bytes
+      content = String.duplicate("x", 160)
+
+      result =
+        Winnow.new(budget: 12, tokenizer: LowOverheadTokenizer)
+        |> Winnow.add(:user,
+          priority: 1000,
+          content: content,
+          overflow: :truncate_end
+        )
+        |> Winnow.render()
+
+      assert result.total_tokens <= 12
+      [piece] = result.included
+      # With overhead=2: available_tokens=10, max_bytes=40
+      # Truncated content should be 40 bytes
+      assert byte_size(piece.content) == 40
+      assert piece.token_count == 12
+    end
+
+    test "truncated piece recount uses tokenizer, not div(byte_size, 4)" do
+      # Use a tokenizer where count_tokens differs from div(byte_size, 4).
+      # With multi-byte chars like "é" (2 bytes each):
+      #   div(byte_size, 4) would undercount compared to byte_size / 4
+      #   The Approximate tokenizer would give div(byte_size, 4)
+      # We use LowOverheadTokenizer (overhead=2, same count_tokens as Approximate)
+      # to verify the recount calls count_tokens, not a hardcoded formula.
+      content = String.duplicate("x", 200)
+
+      result =
+        Winnow.new(budget: 12, tokenizer: LowOverheadTokenizer)
+        |> Winnow.add(:user,
+          priority: 1000,
+          content: content,
+          overflow: :truncate_end
+        )
+        |> Winnow.render()
+
+      [piece] = result.included
+
+      expected_recount =
+        LowOverheadTokenizer.count_tokens(piece.content) + LowOverheadTokenizer.message_overhead()
+
+      assert piece.token_count == expected_recount
+    end
+  end
+
   # Generators for property tests
 
   defp piece_generator do

@@ -53,11 +53,18 @@ defmodule Winnow.Renderer do
     # Build messages (skip empty-content reservation pieces)
     messages = build_messages(final_included)
 
+    # Extract tool definitions from included pieces
+    tools =
+      final_included
+      |> Enum.filter(&(&1.type == :tool_def and not is_nil(&1.metadata)))
+      |> Enum.map(& &1.metadata)
+
     # Compute total tokens
     total_tokens = sum_tokens(final_included)
 
     %RenderResult{
       messages: messages,
+      tools: tools,
       total_tokens: total_tokens,
       budget: budget,
       threshold: threshold,
@@ -241,11 +248,11 @@ defmodule Winnow.Renderer do
         {[fallback_piece | inc], drop, [{piece, index} | fb], remaining - tokens}
 
       nil ->
-        handle_overflow(piece, remaining, inc, drop, fb)
+        handle_overflow(piece, remaining, tokenizer, inc, drop, fb)
     end
   end
 
-  defp handle_overflow(piece, remaining, inc, drop, fb) do
+  defp handle_overflow(piece, remaining, tokenizer, inc, drop, fb) do
     case piece.overflow do
       :error ->
         if piece.token_count > remaining and piece.content != "" do
@@ -255,17 +262,17 @@ defmodule Winnow.Renderer do
         end
 
       :truncate_end ->
-        truncated = truncate_to_fit(piece, remaining, :end)
+        truncated = truncate_to_fit(piece, remaining, :end, tokenizer)
         {[truncated | inc], drop, fb, remaining - truncated.token_count}
 
       :truncate_middle ->
-        truncated = truncate_to_fit(piece, remaining, :middle)
+        truncated = truncate_to_fit(piece, remaining, :middle, tokenizer)
         {[truncated | inc], drop, fb, remaining - truncated.token_count}
     end
   end
 
-  defp truncate_to_fit(piece, remaining, mode) do
-    overhead = 4
+  defp truncate_to_fit(piece, remaining, mode, tokenizer) do
+    overhead = tokenizer.message_overhead()
     available_tokens = max(remaining - overhead, 0)
     max_bytes = available_tokens * 4
 
@@ -288,7 +295,7 @@ defmodule Winnow.Renderer do
           end
       end
 
-    token_count = div(byte_size(content), 4) + overhead
+    token_count = tokenizer.count_tokens(content) + overhead
     %{piece | content: content, token_count: token_count}
   end
 
