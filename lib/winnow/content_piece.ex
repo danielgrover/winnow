@@ -84,6 +84,8 @@ defmodule Winnow.ContentPiece do
   def new(attrs) when is_map(attrs) do
     with :ok <- validate_required(attrs),
          :ok <- validate_role(attrs),
+         :ok <- validate_priority(attrs),
+         :ok <- validate_content(attrs),
          :ok <- validate_overflow(attrs),
          :ok <- validate_type(attrs) do
       {:ok, struct!(__MODULE__, attrs)}
@@ -119,6 +121,17 @@ defmodule Winnow.ContentPiece do
 
   defp validate_role(%{role: role}) when role in @valid_roles, do: :ok
   defp validate_role(%{role: role}), do: {:error, "invalid role: #{inspect(role)}"}
+
+  defp validate_priority(%{priority: :infinity}), do: :ok
+  defp validate_priority(%{priority: p}) when is_integer(p), do: :ok
+
+  defp validate_priority(%{priority: p}),
+    do: {:error, "invalid priority: #{inspect(p)}, must be integer or :infinity"}
+
+  defp validate_content(%{content: c}) when is_binary(c), do: :ok
+
+  defp validate_content(%{content: c}),
+    do: {:error, "invalid content: expected string, got #{inspect(c)}"}
 
   defp validate_overflow(%{overflow: overflow}) when overflow in @valid_overflows, do: :ok
 

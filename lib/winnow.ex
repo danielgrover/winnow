@@ -23,7 +23,7 @@ defmodule Winnow do
   alias Winnow.ContentPiece
 
   @type t :: %__MODULE__{
-          budget: pos_integer(),
+          budget: non_neg_integer(),
           tokenizer: module(),
           pieces: [ContentPiece.t()],
           next_sequence: non_neg_integer(),

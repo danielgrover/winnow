@@ -422,5 +422,57 @@ defmodule WinnowTest do
                  type: :nonsense
                )
     end
+
+    test "rejects non-integer, non-infinity priority" do
+      assert {:error, _} =
+               Winnow.ContentPiece.new(
+                 role: :user,
+                 content: "X",
+                 priority: "high",
+                 sequence: 0
+               )
+    end
+
+    test "rejects float priority" do
+      assert {:error, _} =
+               Winnow.ContentPiece.new(
+                 role: :user,
+                 content: "X",
+                 priority: 5.0,
+                 sequence: 0
+               )
+    end
+
+    test "accepts :infinity priority" do
+      assert {:ok, piece} =
+               Winnow.ContentPiece.new(
+                 role: :user,
+                 content: "X",
+                 priority: :infinity,
+                 sequence: 0
+               )
+
+      assert piece.priority == :infinity
+    end
+
+    test "rejects non-binary content" do
+      assert {:error, _} =
+               Winnow.ContentPiece.new(
+                 role: :user,
+                 content: 123,
+                 priority: 500,
+                 sequence: 0
+               )
+    end
+
+    test "rejects list content" do
+      assert {:error, _} =
+               Winnow.ContentPiece.new(
+                 role: :user,
+                 content: ["hello"],
+                 priority: 500,
+                 sequence: 0
+               )
+    end
   end
 end

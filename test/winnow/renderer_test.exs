@@ -1259,17 +1259,32 @@ defmodule Winnow.RendererTest do
               {9, integer(1..1000)},
               {1, constant(:infinity)}
             ]),
-          content_size <- integer(1..400)
+          content_size <- integer(1..400),
+          cacheable <- frequency([{4, constant(false)}, {1, constant(true)}]),
+          fallback <-
+            frequency([
+              {3, constant(nil)},
+              {1, string(:alphanumeric, min_length: 1, max_length: 50)}
+            ])
         ) do
-      {priority, String.duplicate("x", content_size)}
+      {priority, String.duplicate("x", content_size), cacheable, fallback}
     end
   end
 
   defp build_winnow(budget, pieces) do
     pieces
     |> Enum.with_index()
-    |> Enum.reduce(Winnow.new(budget: budget), fn {{priority, content}, _idx}, w ->
-      Winnow.add(w, :user, priority: priority, content: content, overflow: :truncate_end)
+    |> Enum.reduce(Winnow.new(budget: budget), fn {{priority, content, cacheable, fallback}, _idx},
+                                                  w ->
+      opts = [
+        priority: priority,
+        content: content,
+        overflow: :truncate_end,
+        cacheable: cacheable
+      ]
+
+      opts = if fallback, do: Keyword.put(opts, :fallbacks, [fallback]), else: opts
+      Winnow.add(w, :user, opts)
     end)
   end
 end

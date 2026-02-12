@@ -81,7 +81,7 @@ defmodule Winnow.Renderer do
     }
   end
 
-  # Issue #11: Internal function — public for testability, not part of public API.
+  # Internal function — public for testability, not part of public API.
   @doc false
   @spec find_threshold([ContentPiece.t()], non_neg_integer(), module()) :: number()
   def find_threshold(pieces, budget, tokenizer) do
@@ -167,12 +167,9 @@ defmodule Winnow.Renderer do
 
   # Evaluate conditions: partition into kept pieces and condition-excluded pieces
   defp evaluate_conditions(pieces) do
-    {kept, excluded} =
-      Enum.split_with(pieces, fn piece ->
-        is_nil(piece.condition) or piece.condition.()
-      end)
-
-    {kept, excluded}
+    Enum.split_with(pieces, fn piece ->
+      is_nil(piece.condition) or piece.condition.()
+    end)
   end
 
   # Render sections independently with their own sub-budgets.
@@ -338,25 +335,27 @@ defmodule Winnow.Renderer do
     end
   end
 
-  # Truncate string to at most max_bytes, respecting UTF-8 boundaries
+  # Truncate string to at most max_bytes, respecting UTF-8 boundaries.
+  # Tracks byte offset and uses binary_part/3 for O(n) performance.
   defp truncate_bytes(string, max_bytes) do
-    truncate_bytes_acc(string, max_bytes, <<>>)
+    used = truncate_bytes_used(string, max_bytes, 0)
+    binary_part(string, 0, used)
   end
 
-  defp truncate_bytes_acc(<<>>, _remaining, acc), do: acc
+  defp truncate_bytes_used(<<>>, _remaining, used), do: used
 
-  defp truncate_bytes_acc(string, remaining, acc) do
+  defp truncate_bytes_used(string, remaining, used) do
     case String.next_grapheme(string) do
       nil ->
-        acc
+        used
 
       {grapheme, rest} ->
         grapheme_bytes = byte_size(grapheme)
 
         if grapheme_bytes <= remaining do
-          truncate_bytes_acc(rest, remaining - grapheme_bytes, acc <> grapheme)
+          truncate_bytes_used(rest, remaining - grapheme_bytes, used + grapheme_bytes)
         else
-          acc
+          used
         end
     end
   end
