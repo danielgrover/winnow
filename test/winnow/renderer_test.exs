@@ -210,8 +210,10 @@ defmodule Winnow.RendererTest do
               pieces <- list_of(piece_generator(), min_length: 0, max_length: 20)
             ) do
         w = build_winnow(budget, pieces)
-        result = Winnow.render(w)
-        assert result.total_tokens <= result.budget
+
+        if result = try_render(w) do
+          assert result.total_tokens <= result.budget
+        end
       end
     end
 
@@ -221,10 +223,11 @@ defmodule Winnow.RendererTest do
               pieces <- list_of(piece_generator(), min_length: 1, max_length: 20)
             ) do
         w = build_winnow(budget, pieces)
-        result = Winnow.render(w)
 
-        for piece <- result.included do
-          assert piece.priority == :infinity or piece.priority >= result.threshold
+        if result = try_render(w) do
+          for piece <- result.included do
+            assert piece.priority == :infinity or piece.priority >= result.threshold
+          end
         end
       end
     end
@@ -235,10 +238,11 @@ defmodule Winnow.RendererTest do
               pieces <- list_of(piece_generator(), min_length: 1, max_length: 20)
             ) do
         w = build_winnow(budget, pieces)
-        result = Winnow.render(w)
 
-        for piece <- result.dropped do
-          assert piece.priority < result.threshold
+        if result = try_render(w) do
+          for piece <- result.dropped do
+            assert piece.priority < result.threshold
+          end
         end
       end
     end
@@ -249,8 +253,40 @@ defmodule Winnow.RendererTest do
               pieces <- list_of(piece_generator(), min_length: 0, max_length: 20)
             ) do
         w = build_winnow(budget, pieces)
-        result = Winnow.render(w)
-        assert length(result.included) + length(result.dropped) == length(w.pieces)
+
+        if result = try_render(w) do
+          assert length(result.included) + length(result.dropped) == length(w.pieces)
+        end
+      end
+    end
+
+    property "messages are ordered by sequence" do
+      check all(
+              budget <- integer(1..1000),
+              pieces <- list_of(piece_generator(), min_length: 0, max_length: 20)
+            ) do
+        w = build_winnow(budget, pieces)
+
+        if result = try_render(w) do
+          sequences = Enum.map(result.included, & &1.sequence)
+          assert sequences == Enum.sort(sequences)
+        end
+      end
+    end
+
+    property "cache_breakpoint is nil or valid message index" do
+      check all(
+              budget <- integer(1..1000),
+              pieces <- list_of(piece_generator(), min_length: 0, max_length: 20)
+            ) do
+        w = build_winnow(budget, pieces)
+
+        if result = try_render(w) do
+          case result.cache_breakpoint do
+            nil -> :ok
+            idx -> assert idx >= 0 and idx < length(result.messages)
+          end
+        end
       end
     end
   end
@@ -767,11 +803,409 @@ defmodule Winnow.RendererTest do
     end
   end
 
+  describe "render/1 — cache_breakpoint" do
+    test "nil when no cacheable pieces" do
+      result =
+        Winnow.new(budget: 100)
+        |> Winnow.add(:system, priority: 1000, content: "Hello", token_count: 10)
+        |> Winnow.render()
+
+      assert result.cache_breakpoint == nil
+    end
+
+    test "all cacheable — breakpoint is last message index" do
+      result =
+        Winnow.new(budget: 100)
+        |> Winnow.add(:system, priority: 1000, content: "A", token_count: 5, cacheable: true)
+        |> Winnow.add(:user, priority: 1000, content: "B", token_count: 5, cacheable: true)
+        |> Winnow.add(:user, priority: 1000, content: "C", token_count: 5, cacheable: true)
+        |> Winnow.render()
+
+      assert result.cache_breakpoint == 2
+    end
+
+    test "cacheable at start, non-cacheable after" do
+      result =
+        Winnow.new(budget: 100)
+        |> Winnow.add(:system, priority: 1000, content: "Sys", token_count: 5, cacheable: true)
+        |> Winnow.add(:system, priority: 1000, content: "Tools", token_count: 5, cacheable: true)
+        |> Winnow.add(:user, priority: 900, content: "Task", token_count: 5)
+        |> Winnow.render()
+
+      assert result.cache_breakpoint == 1
+    end
+
+    test "cacheable piece with empty content (reservation) is skipped" do
+      result =
+        Winnow.new(budget: 100)
+        |> Winnow.add(:system, priority: 1000, content: "Hello", token_count: 5, cacheable: true)
+        |> Winnow.reserve(:response, tokens: 10)
+        |> Winnow.add(:user, priority: 900, content: "Task", token_count: 5)
+        |> Winnow.render()
+
+      # Reserve has empty content, not in messages. Breakpoint is index 0 (Hello).
+      assert result.cache_breakpoint == 0
+      assert length(result.messages) == 2
+    end
+
+    test "non-contiguous cacheable pieces — breakpoint at last cacheable message" do
+      result =
+        Winnow.new(budget: 100)
+        |> Winnow.add(:system, priority: 1000, content: "A", token_count: 5, cacheable: true)
+        |> Winnow.add(:user, priority: 1000, content: "B", token_count: 5)
+        |> Winnow.add(:user, priority: 1000, content: "C", token_count: 5, cacheable: true)
+        |> Winnow.add(:user, priority: 1000, content: "D", token_count: 5)
+        |> Winnow.render()
+
+      # Messages: A(0), B(1), C(2), D(3). Last cacheable = C at index 2.
+      assert result.cache_breakpoint == 2
+    end
+
+    test "cacheable piece dropped by priority — no breakpoint" do
+      result =
+        Winnow.new(budget: 15)
+        |> Winnow.add(:system, priority: 1000, content: "Sys", token_count: 10)
+        |> Winnow.add(:user, priority: 100, content: "Cache me", token_count: 10, cacheable: true)
+        |> Winnow.render()
+
+      # Cacheable piece dropped because low priority
+      assert result.cache_breakpoint == nil
+    end
+  end
+
+  describe "render/1 — binary search / fallback imprecision" do
+    test "binary search optimistic, greedy resolves to fallback" do
+      # A: primary=15, fallback="a" (~4 tokens)
+      # B: primary=12, fallback="b" (~4 tokens)
+      # Budget=20. Binary search min costs: A=min(15,4)=4, B=min(12,4)=4 → 8, fits.
+      # Greedy: A primary=15, fits (remaining=5). B primary=12>5.
+      # B fallback "b" = div(1,4)+4 = 4 tokens. 4 <= 5? Yes!
+      result =
+        Winnow.new(budget: 20)
+        |> Winnow.add(:user,
+          priority: 500,
+          content: String.duplicate("a", 60),
+          token_count: 15,
+          fallbacks: ["a"]
+        )
+        |> Winnow.add(:user,
+          priority: 500,
+          content: String.duplicate("b", 48),
+          token_count: 12,
+          fallbacks: ["b"]
+        )
+        |> Winnow.render()
+
+      assert result.total_tokens <= 20
+      assert length(result.included) == 2
+      # B used fallback
+      assert result.fallbacks_used != []
+      {fb_piece, _idx} = hd(result.fallbacks_used)
+      assert fb_piece.content == String.duplicate("b", 48)
+    end
+
+    test "fallback used when primary fits by threshold but not by greedy budget" do
+      # A: primary=15, fallback="aa" (~4 tokens)
+      # B: primary=10, fallback="bb" (~4 tokens)
+      # Budget=19. Binary search min costs: A=4, B=4 → 8, fits at p500.
+      # Greedy: A primary=15, fits (remaining=4). B primary=10>4.
+      # B fallback "bb" = div(2,4)+4 = 4 tokens. 4 <= 4? Yes!
+      result =
+        Winnow.new(budget: 19)
+        |> Winnow.add(:user,
+          priority: 500,
+          content: String.duplicate("a", 60),
+          token_count: 15,
+          fallbacks: ["aa"]
+        )
+        |> Winnow.add(:user,
+          priority: 500,
+          content: String.duplicate("b", 40),
+          token_count: 10,
+          fallbacks: ["bb"]
+        )
+        |> Winnow.render()
+
+      assert result.total_tokens == 19
+      assert length(result.included) == 2
+      assert length(result.fallbacks_used) == 1
+      {fb_piece, 0} = hd(result.fallbacks_used)
+      assert fb_piece.content == String.duplicate("b", 40)
+    end
+  end
+
+  describe "render/1 — truncation edge cases" do
+    test "truncate with remaining = overhead exactly — empty content" do
+      # Budget = 4 (just overhead for approximate tokenizer).
+      # Piece with truncate_end, large content. available_tokens = 4-4 = 0. max_bytes = 0.
+      result =
+        Winnow.new(budget: 4)
+        |> Winnow.add(:user,
+          priority: 1000,
+          content: String.duplicate("x", 100),
+          overflow: :truncate_end
+        )
+        |> Winnow.render()
+
+      # Truncated to empty content. token_count = count_tokens("") + overhead = 0 + 4 = 4.
+      assert result.total_tokens == 4
+      # Empty content piece gets excluded from messages by build_messages
+      assert result.messages == []
+      assert length(result.included) == 1
+    end
+
+    test "truncate_middle with content shorter than marker doesn't crash" do
+      # Content "ab" = 2 bytes. Marker " [...] " = 7 bytes.
+      # Budget allows ~3 tokens content + 4 overhead = ~16 budget needed for full content.
+      # Let's force truncation by setting budget low.
+      result =
+        Winnow.new(budget: 5)
+        |> Winnow.add(:user,
+          priority: 1000,
+          content: "ab",
+          overflow: :truncate_middle
+        )
+        |> Winnow.render()
+
+      assert result.total_tokens <= 5
+      [piece] = result.included
+      assert String.valid?(piece.content)
+    end
+
+    test "truncate_end with full budget consumed — piece excluded by threshold" do
+      # Reserve takes the full budget (10). Truncatable piece's min cost is
+      # overhead (4). 10 + 4 = 14 > 10, so threshold excludes the truncatable piece.
+      result =
+        Winnow.new(budget: 10)
+        |> Winnow.reserve(:response, tokens: 10)
+        |> Winnow.add(:user,
+          priority: 1000,
+          content: String.duplicate("x", 100),
+          overflow: :truncate_end
+        )
+        |> Winnow.render()
+
+      assert result.total_tokens == 10
+      assert length(result.included) == 1
+      assert hd(result.included).name == :response
+      assert length(result.dropped) == 1
+    end
+  end
+
+  describe "render/1 — priority edge cases" do
+    test "all pieces :infinity — threshold is 0, all included" do
+      result =
+        Winnow.new(budget: 100)
+        |> Winnow.add(:system, priority: :infinity, content: "A", token_count: 10)
+        |> Winnow.add(:user, priority: :infinity, content: "B", token_count: 10)
+        |> Winnow.render()
+
+      assert result.threshold == 0
+      assert length(result.included) == 2
+      assert result.dropped == []
+    end
+
+    test "budget = 1 with piece overhead > 1 — dropped by greedy pass" do
+      # Approximate tokenizer: "x" → div(1,4)+4 = 4 tokens. Budget = 1.
+      result =
+        Winnow.new(budget: 1)
+        |> Winnow.add(:user, priority: 1000, content: "x")
+        |> Winnow.render()
+
+      # Token count = 4 > budget 1. Threshold should exclude it.
+      assert result.messages == []
+      assert result.dropped != []
+    end
+
+    test "mix of :infinity and regular priorities" do
+      result =
+        Winnow.new(budget: 25)
+        |> Winnow.add(:system, priority: :infinity, content: "Always", token_count: 10)
+        |> Winnow.add(:user, priority: 1000, content: "High", token_count: 10)
+        |> Winnow.add(:user, priority: 100, content: "Low", token_count: 10)
+        |> Winnow.render()
+
+      # Budget 25: infinity(10) + 1000(10) = 20 fits. Adding 100 = 30 > 25.
+      contents = Enum.map(result.messages, & &1.content)
+      assert "Always" in contents
+      assert "High" in contents
+      refute "Low" in contents
+    end
+  end
+
+  describe "render/1 — section edge cases" do
+    test "section max_tokens > main budget — section respects its own budget" do
+      result =
+        Winnow.new(budget: 20)
+        |> Winnow.section(:big, max_tokens: 1000)
+        |> Winnow.add(:user,
+          priority: 1000,
+          content: "Sec",
+          token_count: 10,
+          section: :big
+        )
+        |> Winnow.add(:system, priority: 1000, content: "Main", token_count: 10)
+        |> Winnow.render()
+
+      # Section piece (10) fits within section budget (1000).
+      # Then main pass: section piece (10) + main piece (10) = 20 = budget.
+      assert result.total_tokens == 20
+      contents = Enum.map(result.messages, & &1.content)
+      assert "Sec" in contents
+      assert "Main" in contents
+    end
+
+    test "piece assigned to undeclared section — treated as main piece" do
+      result =
+        Winnow.new(budget: 100)
+        |> Winnow.add(:user,
+          priority: 1000,
+          content: "Orphan",
+          token_count: 10,
+          section: :nonexistent
+        )
+        |> Winnow.render()
+
+      assert [%{content: "Orphan"}] = result.messages
+      assert result.total_tokens == 10
+    end
+
+    test "section with zero max_tokens — all section pieces dropped" do
+      result =
+        Winnow.new(budget: 100)
+        |> Winnow.section(:empty, max_tokens: 0)
+        |> Winnow.add(:user,
+          priority: 1000,
+          content: "Doomed",
+          token_count: 10,
+          section: :empty
+        )
+        |> Winnow.add(:system, priority: 1000, content: "Main", token_count: 10)
+        |> Winnow.render()
+
+      contents = Enum.map(result.messages, & &1.content)
+      refute "Doomed" in contents
+      assert "Main" in contents
+    end
+  end
+
+  describe "render/1 — fallback edge cases" do
+    test "fallback larger than primary — primary used since it fits" do
+      result =
+        Winnow.new(budget: 100)
+        |> Winnow.add(:user,
+          priority: 500,
+          content: "X",
+          token_count: 5,
+          fallbacks: [String.duplicate("y", 200)]
+        )
+        |> Winnow.render()
+
+      assert [%{content: "X"}] = result.messages
+      assert result.fallbacks_used == []
+    end
+
+    test "multiple fallbacks where only middle one fits" do
+      # Primary too large, first fallback too large, second fits, third too large.
+      result =
+        Winnow.new(budget: 15)
+        |> Winnow.add(:system, priority: 1000, content: "Sys", token_count: 10)
+        |> Winnow.add(:user,
+          priority: 1000,
+          content: String.duplicate("a", 200),
+          token_count: 50,
+          fallbacks: [
+            String.duplicate("b", 200),
+            "ok",
+            String.duplicate("c", 200)
+          ]
+        )
+        |> Winnow.render()
+
+      # Remaining after Sys = 5. Primary=50, fb0=large, fb1="ok"=div(2,4)+4=4+1=5, fits!
+      contents = Enum.map(result.messages, & &1.content)
+      assert "ok" in contents
+      assert length(result.fallbacks_used) == 1
+      {_piece, index} = hd(result.fallbacks_used)
+      assert index == 1
+    end
+  end
+
+  describe "render/1 — tightened assertions" do
+    test "single piece exact token count" do
+      result =
+        Winnow.new(budget: 100)
+        |> Winnow.add(:system, priority: 1000, content: "Hello", token_count: 10)
+        |> Winnow.render()
+
+      assert result.total_tokens == 10
+    end
+
+    test "two pieces exact token count" do
+      result =
+        Winnow.new(budget: 100)
+        |> Winnow.add(:system, priority: 1000, content: "A", token_count: 10)
+        |> Winnow.add(:user, priority: 500, content: "B", token_count: 15)
+        |> Winnow.render()
+
+      assert result.total_tokens == 25
+    end
+
+    test "reserve + piece exact total" do
+      result =
+        Winnow.new(budget: 100)
+        |> Winnow.reserve(:response, tokens: 50)
+        |> Winnow.add(:system, priority: 1000, content: "A", token_count: 10)
+        |> Winnow.render()
+
+      assert result.total_tokens == 60
+    end
+
+    test "section piece exact token count" do
+      result =
+        Winnow.new(budget: 100)
+        |> Winnow.section(:mem, max_tokens: 50)
+        |> Winnow.add(:user, priority: 1000, content: "M", token_count: 8, section: :mem)
+        |> Winnow.add(:system, priority: 1000, content: "S", token_count: 12)
+        |> Winnow.render()
+
+      assert result.total_tokens == 20
+    end
+
+    test "multiple pieces with fallbacks — exact total" do
+      result =
+        Winnow.new(budget: 25)
+        |> Winnow.add(:system, priority: 1000, content: "S", token_count: 5)
+        |> Winnow.add(:user,
+          priority: 1000,
+          content: "Long A",
+          token_count: 15,
+          fallbacks: ["A"]
+        )
+        |> Winnow.add(:user,
+          priority: 1000,
+          content: "Long B",
+          token_count: 15,
+          fallbacks: ["B"]
+        )
+        |> Winnow.render()
+
+      # S=5. Greedy: A primary=15, fits (remaining=20). B primary=15>5.
+      # B fallback "B" = div(1,4)+4 = 0+4 = 4. Fits!
+      # Total: 5 + 15 + 4 = 24.
+      assert result.total_tokens == 24
+    end
+  end
+
   # Generators for property tests
 
   defp piece_generator do
     gen all(
-          priority <- integer(1..1000),
+          priority <-
+            frequency([
+              {9, integer(1..1000)},
+              {1, constant(:infinity)}
+            ]),
           token_count <- integer(1..100)
         ) do
       {priority, token_count}
@@ -784,5 +1218,14 @@ defmodule Winnow.RendererTest do
     |> Enum.reduce(Winnow.new(budget: budget), fn {{priority, token_count}, _idx}, w ->
       Winnow.add(w, :user, priority: priority, content: "x", token_count: token_count)
     end)
+  end
+
+  # Renders a winnow, returning nil if OversizedContentError is raised.
+  # Property tests use this since :infinity pieces can cause greedy-pass
+  # budget exhaustion that raises for regular pieces — expected behavior.
+  defp try_render(w) do
+    Winnow.render(w)
+  rescue
+    Winnow.OversizedContentError -> nil
   end
 end

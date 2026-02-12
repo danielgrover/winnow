@@ -188,6 +188,14 @@ Built-in tokenizers:
 4. Fallbacks are resolved greedily after the threshold is set
 5. Output is ordered by sequence, not priority
 
+## Best Practices
+
+**Prioritize the edges.** LLMs attend more to the beginning and end of their context window (the "lost in the middle" effect). Place your highest-signal content at low sequence numbers (system prompt, instructions) and high sequence numbers (current task, user query). Background context and memory sit in the middle where it's OK if attention is weaker.
+
+**Use `cacheable: true` for stable content.** System prompts, tool definitions, and other content that rarely changes between calls should be marked `cacheable: true` and placed at the start (low sequence numbers). After rendering, use `result.cache_breakpoint` to place Anthropic's `cache_control: %{type: "ephemeral"}` marker on the corresponding message — everything up to and including that index can be cached across requests.
+
+**Less is more.** Dropping low-priority content isn't just a budget constraint — it often *improves* output quality. Irrelevant context dilutes attention (sometimes called "context rot"). Trust Winnow's priority system: if content is borderline useful, give it a low priority and let the renderer drop it when space is tight.
+
 ## Inspirations
 
 Winnow draws from several systems and ideas in the prompt engineering ecosystem:

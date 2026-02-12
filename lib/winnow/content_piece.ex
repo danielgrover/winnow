@@ -20,7 +20,9 @@ defmodule Winnow.ContentPiece do
   - `fallbacks` — ordered list of fallback content strings
   - `section` — atom naming a sub-budget section
   - `cacheable` — hint for cache-friendly ordering (default `false`)
-  - `type` — `:text`, `:image`, `:tool_def`, or `:file` (default `:text`)
+  - `type` — `:text`, `:image`, `:tool_def`, or `:file` (default `:text`).
+    Only `:tool_def` has library-level behavior (populates `RenderResult.tools`);
+    the others are semantic markers for caller use.
   - `condition` — zero-arity function; piece excluded if it returns `false`
   - `overflow` — `:error`, `:truncate_end`, or `:truncate_middle` (default `:error`)
   - `name` — optional identifier (e.g. for reservations)

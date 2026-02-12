@@ -62,6 +62,8 @@ defmodule Winnow.Renderer do
     # Compute total tokens
     total_tokens = sum_tokens(final_included)
 
+    cache_breakpoint = compute_cache_breakpoint(final_included)
+
     %RenderResult{
       messages: messages,
       tools: tools,
@@ -70,7 +72,8 @@ defmodule Winnow.Renderer do
       threshold: threshold,
       included: final_included,
       dropped: all_dropped,
-      fallbacks_used: all_fallbacks
+      fallbacks_used: all_fallbacks,
+      cache_breakpoint: cache_breakpoint
     }
   end
 
@@ -357,6 +360,23 @@ defmodule Winnow.Renderer do
     |> Enum.map(fn piece ->
       %{role: piece.role, content: piece.content}
     end)
+  end
+
+  # Finds the index into messages of the last cacheable piece.
+  # Empty-content pieces (reservations) don't produce messages and are skipped.
+  defp compute_cache_breakpoint(pieces) do
+    message_pieces = Enum.reject(pieces, &(&1.content == ""))
+
+    result =
+      message_pieces
+      |> Enum.with_index()
+      |> Enum.filter(fn {piece, _idx} -> piece.cacheable end)
+      |> List.last()
+
+    case result do
+      nil -> nil
+      {_piece, idx} -> idx
+    end
   end
 
   defp sum_tokens(pieces) do

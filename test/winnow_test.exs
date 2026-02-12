@@ -244,6 +244,51 @@ defmodule WinnowTest do
     end
   end
 
+  describe "add_tools/3 edge cases" do
+    test "empty tools list is a no-op" do
+      w =
+        Winnow.new(budget: 4000)
+        |> Winnow.add_tools([], priority: 500)
+
+      assert w.pieces == []
+      assert w.next_sequence == 0
+    end
+  end
+
+  describe "add_each/3 edge cases" do
+    test "single item adds one piece correctly" do
+      w =
+        Winnow.new(budget: 4000)
+        |> Winnow.add_each(:user,
+          items: ["only"],
+          priority: 500,
+          formatter: &Function.identity/1
+        )
+
+      assert length(w.pieces) == 1
+      assert hd(w.pieces).content == "only"
+      assert hd(w.pieces).priority == 500
+    end
+  end
+
+  describe "reserve/3 edge cases" do
+    test "reserved piece not in rendered messages" do
+      result =
+        Winnow.new(budget: 100)
+        |> Winnow.reserve(:response, tokens: 10)
+        |> Winnow.add(:system, priority: 1000, content: "Hello", token_count: 5)
+        |> Winnow.render()
+
+      # Reserve piece is included but has empty content → excluded from messages
+      assert length(result.messages) == 1
+      assert hd(result.messages).content == "Hello"
+      # But it's in included
+      reserve_piece = Enum.find(result.included, &(&1.name == :response))
+      assert reserve_piece != nil
+      assert reserve_piece.content == ""
+    end
+  end
+
   describe "merge/2" do
     test "combines pieces from both structs" do
       left =
@@ -302,6 +347,20 @@ defmodule WinnowTest do
 
       assert Map.has_key?(merged.sections, :memory)
       assert Map.has_key?(merged.sections, :tools)
+    end
+
+    test "merge where both sides define same section — right overwrites left" do
+      left =
+        Winnow.new(budget: 1000)
+        |> Winnow.section(:memory, max_tokens: 200)
+
+      right =
+        Winnow.new(budget: 500)
+        |> Winnow.section(:memory, max_tokens: 500)
+
+      merged = Winnow.merge(left, right)
+
+      assert merged.sections.memory.max_tokens == 500
     end
 
     test "merge with empty right is no-op" do

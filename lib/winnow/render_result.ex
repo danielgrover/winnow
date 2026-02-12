@@ -15,11 +15,14 @@ defmodule Winnow.RenderResult do
   - `included` — list of `ContentPiece` structs that made the cut
   - `dropped` — list of `ContentPiece` structs that didn't fit
   - `fallbacks_used` — list of `{ContentPiece, fallback_index}` tuples
+  - `cache_breakpoint` — index into `messages` of the last message derived from
+    a piece with `cacheable: true`, or `nil` if no cacheable pieces are included.
+    Use this to place Anthropic's `cache_control` marker.
 
   ## Example
 
       iex> %Winnow.RenderResult{}
-      %Winnow.RenderResult{messages: [], tools: [], total_tokens: 0, budget: 0, threshold: 0, included: [], dropped: [], fallbacks_used: []}
+      %Winnow.RenderResult{messages: [], tools: [], total_tokens: 0, budget: 0, threshold: 0, included: [], dropped: [], fallbacks_used: [], cache_breakpoint: nil}
   """
 
   @type t :: %__MODULE__{
@@ -30,7 +33,8 @@ defmodule Winnow.RenderResult do
           threshold: number(),
           included: [Winnow.ContentPiece.t()],
           dropped: [Winnow.ContentPiece.t()],
-          fallbacks_used: [{Winnow.ContentPiece.t(), non_neg_integer()}]
+          fallbacks_used: [{Winnow.ContentPiece.t(), non_neg_integer()}],
+          cache_breakpoint: non_neg_integer() | nil
         }
 
   defstruct messages: [],
@@ -40,5 +44,6 @@ defmodule Winnow.RenderResult do
             threshold: 0,
             included: [],
             dropped: [],
-            fallbacks_used: []
+            fallbacks_used: [],
+            cache_breakpoint: nil
 end
