@@ -28,9 +28,9 @@ The core problem: an agent has N pieces of content to include in a prompt. Their
 
 **Read this before making any architectural or implementation decisions:**
 
-`prompt-composition-landscape.md` — the full research survey and design specification. Contains survey of existing systems (LangChain, LlamaIndex, Priompt, DSPy, etc.), the complete design (ContentPiece struct, architecture, render pipeline, API sketches), all design considerations, module breakdown, testing strategy, implementation order, and integration points with ReqLLM.
+`dev/prompt-composition-landscape.md` — the full research survey and design specification. Contains survey of existing systems (LangChain, LlamaIndex, Priompt, DSPy, etc.), the complete design (ContentPiece struct, architecture, render pipeline, API sketches), all design considerations, module breakdown, testing strategy, implementation order, and integration points with ReqLLM.
 
-`implementation-reference.md` — concrete implementation details. Contains verified ReqLLM v1.5.1 struct shapes (Context, Message, ContentPart, Tool), tokenizer ecosystem survey and decision, the actual Priompt threshold algorithm (binary search pseudocode + Elixir sketch), and all resolved design decisions. **Read this alongside the landscape doc — it fills the gaps.**
+`dev/implementation-reference.md` — concrete implementation details. Contains verified ReqLLM v1.5.1 struct shapes (Context, Message, ContentPart, Tool), tokenizer ecosystem survey and decision, the actual Priompt threshold algorithm (binary search pseudocode + Elixir sketch), and all resolved design decisions. **Read this alongside the landscape doc — it fills the gaps.**
 
 ## What Good Looks Like
 
