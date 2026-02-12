@@ -25,7 +25,7 @@ defmodule Winnow.Renderer do
     budget = winnow.budget
 
     # Step 1: Evaluate conditions — exclude pieces where condition returns false
-    pieces = evaluate_conditions(winnow.pieces)
+    {pieces, condition_excluded} = evaluate_conditions(winnow.pieces)
 
     # Step 2: Compute token costs for each piece (primary and fallbacks)
     costed_pieces = compute_token_costs(pieces, tokenizer)
@@ -50,8 +50,11 @@ defmodule Winnow.Renderer do
     # Sort included by sequence for output ordering
     final_included = Enum.sort_by(final_included, & &1.sequence)
 
-    # Build messages (skip empty-content reservation pieces)
-    messages = build_messages(final_included)
+    # Filter out empty-content pieces (reservations) for messages and cache
+    message_pieces = Enum.reject(final_included, &(&1.content == ""))
+
+    # Build messages
+    messages = Enum.map(message_pieces, &%{role: &1.role, content: &1.content})
 
     # Extract tool definitions from included pieces
     tools =
@@ -62,7 +65,7 @@ defmodule Winnow.Renderer do
     # Compute total tokens
     total_tokens = sum_tokens(final_included)
 
-    cache_breakpoint = compute_cache_breakpoint(final_included)
+    cache_breakpoint = compute_cache_breakpoint(message_pieces)
 
     %RenderResult{
       messages: messages,
@@ -73,18 +76,13 @@ defmodule Winnow.Renderer do
       included: final_included,
       dropped: all_dropped,
       fallbacks_used: all_fallbacks,
-      cache_breakpoint: cache_breakpoint
+      cache_breakpoint: cache_breakpoint,
+      condition_excluded: condition_excluded
     }
   end
 
-  @doc """
-  Finds the priority threshold via binary search.
-
-  Returns the lowest threshold value where the sum of tokens for all pieces
-  with `priority >= threshold` fits within the budget. Uses a sentinel value
-  above all real levels so that when nothing fits, all non-infinity pieces
-  are excluded.
-  """
+  # Issue #11: Internal function — public for testability, not part of public API.
+  @doc false
   @spec find_threshold([ContentPiece.t()], non_neg_integer(), module()) :: number()
   def find_threshold(pieces, budget, tokenizer) do
     levels =
@@ -104,36 +102,39 @@ defmodule Winnow.Renderer do
         sentinel = List.last(levels) + 1
         all_levels = levels ++ [sentinel]
         levels_tuple = List.to_tuple(all_levels)
-        binary_search(levels_tuple, -1, tuple_size(levels_tuple) - 1, budget, pieces, tokenizer)
+
+        # Precompute min costs once (avoids recomputing fallback token
+        # counts on every binary search probe).
+        costed = Enum.map(pieces, &{&1, min_token_cost(&1, tokenizer)})
+
+        binary_search(levels_tuple, -1, tuple_size(levels_tuple) - 1, budget, costed)
     end
   end
 
   # Binary search: find lowest index in levels where tokens at that threshold fit.
   # lower is exclusive, upper is inclusive.
-  defp binary_search(levels, lower, upper, _budget, _pieces, _tokenizer)
+  defp binary_search(levels, lower, upper, _budget, _costed)
        when lower >= upper - 1 do
     elem(levels, upper)
   end
 
-  defp binary_search(levels, lower, upper, budget, pieces, tokenizer) do
+  defp binary_search(levels, lower, upper, budget, costed) do
     mid = div(lower + upper, 2)
     threshold = elem(levels, mid)
-    tokens = count_at_threshold(pieces, threshold, tokenizer)
+    tokens = count_at_threshold(costed, threshold)
 
     if tokens <= budget do
-      binary_search(levels, lower, mid, budget, pieces, tokenizer)
+      binary_search(levels, lower, mid, budget, costed)
     else
-      binary_search(levels, mid, upper, budget, pieces, tokenizer)
+      binary_search(levels, mid, upper, budget, costed)
     end
   end
 
-  # Use minimum possible token cost for each piece (primary or smallest fallback)
-  # so the binary search is optimistic about what fits. The greedy pass resolves
-  # which version (primary vs fallback) actually gets used.
-  defp count_at_threshold(pieces, threshold, tokenizer) do
-    pieces
-    |> Enum.filter(&priority_gte?(&1.priority, threshold))
-    |> Enum.reduce(0, fn piece, acc -> acc + min_token_cost(piece, tokenizer) end)
+  # Sum precomputed min costs for pieces at or above threshold.
+  defp count_at_threshold(costed, threshold) do
+    Enum.reduce(costed, 0, fn {piece, cost}, acc ->
+      if priority_gte?(piece.priority, threshold), do: acc + cost, else: acc
+    end)
   end
 
   defp min_token_cost(piece, tokenizer) do
@@ -164,11 +165,14 @@ defmodule Winnow.Renderer do
     Enum.split_with(pieces, &priority_gte?(&1.priority, threshold))
   end
 
-  # Evaluate conditions: keep pieces with nil condition or where condition returns true
+  # Evaluate conditions: partition into kept pieces and condition-excluded pieces
   defp evaluate_conditions(pieces) do
-    Enum.filter(pieces, fn piece ->
-      is_nil(piece.condition) or piece.condition.()
-    end)
+    {kept, excluded} =
+      Enum.split_with(pieces, fn piece ->
+        is_nil(piece.condition) or piece.condition.()
+      end)
+
+    {kept, excluded}
   end
 
   # Render sections independently with their own sub-budgets.
@@ -258,48 +262,80 @@ defmodule Winnow.Renderer do
   defp handle_overflow(piece, remaining, tokenizer, inc, drop, fb) do
     case piece.overflow do
       :error ->
-        if piece.token_count > remaining and piece.content != "" do
+        # Empty-content pieces (e.g. reservations that slipped through) are
+        # silently dropped rather than raising.
+        if piece.content != "" do
           raise Winnow.OversizedContentError, piece: piece, remaining_budget: remaining
         else
           {inc, [piece | drop], fb, remaining}
         end
 
-      :truncate_end ->
-        truncated = truncate_to_fit(piece, remaining, :end, tokenizer)
-        {[truncated | inc], drop, fb, remaining - truncated.token_count}
+      mode when mode in [:truncate_end, :truncate_middle] ->
+        handle_truncation(piece, remaining, mode, tokenizer, inc, drop, fb)
+    end
+  end
 
-      :truncate_middle ->
-        truncated = truncate_to_fit(piece, remaining, :middle, tokenizer)
-        {[truncated | inc], drop, fb, remaining - truncated.token_count}
+  defp handle_truncation(piece, remaining, mode, tokenizer, inc, drop, fb) do
+    overhead = tokenizer.message_overhead()
+
+    if remaining < overhead do
+      # Can't even fit message overhead — drop the piece
+      {inc, [piece | drop], fb, remaining}
+    else
+      truncate_mode = if mode == :truncate_end, do: :end, else: :middle
+      truncated = truncate_to_fit(piece, remaining, truncate_mode, tokenizer)
+      {[truncated | inc], drop, fb, remaining - truncated.token_count}
     end
   end
 
   defp truncate_to_fit(piece, remaining, mode, tokenizer) do
     overhead = tokenizer.message_overhead()
-    available_tokens = max(remaining - overhead, 0)
+    available_tokens = remaining - overhead
+    # Start with optimistic byte estimate (4 bytes/token, exact for Approximate)
     max_bytes = available_tokens * 4
 
-    content =
-      case mode do
-        :end ->
-          truncate_bytes(piece.content, max_bytes)
-
-        :middle ->
-          if byte_size(piece.content) <= max_bytes do
-            piece.content
-          else
-            marker = " [...] "
-            marker_bytes = byte_size(marker)
-            usable = max(max_bytes - marker_bytes, 0)
-            half = div(usable, 2)
-            prefix = truncate_bytes(piece.content, half)
-            suffix = truncate_bytes_from_end(piece.content, half)
-            prefix <> marker <> suffix
-          end
-      end
-
+    content = fit_content(piece.content, max_bytes, available_tokens, mode, tokenizer)
     token_count = tokenizer.count_tokens(content) + overhead
     %{piece | content: content, token_count: token_count}
+  end
+
+  # Truncate content to fit within available_tokens. If the initial byte
+  # estimate overshoots (tokenizer has fewer bytes per token than 4),
+  # iteratively shrink using the actual ratio from the tokenizer.
+  defp fit_content(_original, max_bytes, _available_tokens, _mode, _tokenizer)
+       when max_bytes <= 0 do
+    ""
+  end
+
+  defp fit_content(original, max_bytes, available_tokens, mode, tokenizer) do
+    content = truncate_content(original, max_bytes, mode)
+    tokens = tokenizer.count_tokens(content)
+
+    if tokens <= available_tokens or byte_size(content) == 0 do
+      content
+    else
+      # Over-estimated bytes. Shrink proportionally and ensure progress.
+      new_max = min(div(max_bytes * available_tokens, tokens), byte_size(content) - 1)
+      fit_content(original, max(new_max, 0), available_tokens, mode, tokenizer)
+    end
+  end
+
+  defp truncate_content(original, max_bytes, :end) do
+    truncate_bytes(original, max_bytes)
+  end
+
+  defp truncate_content(original, max_bytes, :middle) do
+    if byte_size(original) <= max_bytes do
+      original
+    else
+      marker = " [...] "
+      marker_bytes = byte_size(marker)
+      usable = max(max_bytes - marker_bytes, 0)
+      half = div(usable, 2)
+      prefix = truncate_bytes(original, half)
+      suffix = truncate_bytes_from_end(original, half)
+      prefix <> marker <> suffix
+    end
   end
 
   # Truncate string to at most max_bytes, respecting UTF-8 boundaries
@@ -354,19 +390,9 @@ defmodule Winnow.Renderer do
     end)
   end
 
-  defp build_messages(pieces) do
-    pieces
-    |> Enum.reject(&(&1.content == ""))
-    |> Enum.map(fn piece ->
-      %{role: piece.role, content: piece.content}
-    end)
-  end
-
   # Finds the index into messages of the last cacheable piece.
-  # Empty-content pieces (reservations) don't produce messages and are skipped.
-  defp compute_cache_breakpoint(pieces) do
-    message_pieces = Enum.reject(pieces, &(&1.content == ""))
-
+  # Expects pre-filtered message_pieces (no empty-content reservations).
+  defp compute_cache_breakpoint(message_pieces) do
     result =
       message_pieces
       |> Enum.with_index()

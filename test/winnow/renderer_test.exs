@@ -209,11 +209,8 @@ defmodule Winnow.RendererTest do
               budget <- integer(1..1000),
               pieces <- list_of(piece_generator(), min_length: 0, max_length: 20)
             ) do
-        w = build_winnow(budget, pieces)
-
-        if result = try_render(w) do
-          assert result.total_tokens <= result.budget
-        end
+        result = build_winnow(budget, pieces) |> Winnow.render()
+        assert result.total_tokens <= result.budget
       end
     end
 
@@ -222,28 +219,23 @@ defmodule Winnow.RendererTest do
               budget <- integer(1..1000),
               pieces <- list_of(piece_generator(), min_length: 1, max_length: 20)
             ) do
-        w = build_winnow(budget, pieces)
+        result = build_winnow(budget, pieces) |> Winnow.render()
 
-        if result = try_render(w) do
-          for piece <- result.included do
-            assert piece.priority == :infinity or piece.priority >= result.threshold
-          end
+        for piece <- result.included do
+          assert piece.priority == :infinity or piece.priority >= result.threshold
         end
       end
     end
 
-    property "all dropped pieces have priority < threshold" do
+    property "no piece in both included and dropped" do
       check all(
               budget <- integer(1..1000),
               pieces <- list_of(piece_generator(), min_length: 1, max_length: 20)
             ) do
-        w = build_winnow(budget, pieces)
-
-        if result = try_render(w) do
-          for piece <- result.dropped do
-            assert piece.priority < result.threshold
-          end
-        end
+        result = build_winnow(budget, pieces) |> Winnow.render()
+        included_seqs = MapSet.new(result.included, & &1.sequence)
+        dropped_seqs = MapSet.new(result.dropped, & &1.sequence)
+        assert MapSet.disjoint?(included_seqs, dropped_seqs)
       end
     end
 
@@ -253,10 +245,8 @@ defmodule Winnow.RendererTest do
               pieces <- list_of(piece_generator(), min_length: 0, max_length: 20)
             ) do
         w = build_winnow(budget, pieces)
-
-        if result = try_render(w) do
-          assert length(result.included) + length(result.dropped) == length(w.pieces)
-        end
+        result = Winnow.render(w)
+        assert length(result.included) + length(result.dropped) == length(w.pieces)
       end
     end
 
@@ -265,12 +255,9 @@ defmodule Winnow.RendererTest do
               budget <- integer(1..1000),
               pieces <- list_of(piece_generator(), min_length: 0, max_length: 20)
             ) do
-        w = build_winnow(budget, pieces)
-
-        if result = try_render(w) do
-          sequences = Enum.map(result.included, & &1.sequence)
-          assert sequences == Enum.sort(sequences)
-        end
+        result = build_winnow(budget, pieces) |> Winnow.render()
+        sequences = Enum.map(result.included, & &1.sequence)
+        assert sequences == Enum.sort(sequences)
       end
     end
 
@@ -279,13 +266,11 @@ defmodule Winnow.RendererTest do
               budget <- integer(1..1000),
               pieces <- list_of(piece_generator(), min_length: 0, max_length: 20)
             ) do
-        w = build_winnow(budget, pieces)
+        result = build_winnow(budget, pieces) |> Winnow.render()
 
-        if result = try_render(w) do
-          case result.cache_breakpoint do
-            nil -> :ok
-            idx -> assert idx >= 0 and idx < length(result.messages)
-          end
+        case result.cache_breakpoint do
+          nil -> :ok
+          idx -> assert idx >= 0 and idx < length(result.messages)
         end
       end
     end
@@ -505,6 +490,28 @@ defmodule Winnow.RendererTest do
       user_msg = hd(result.messages)
       assert String.valid?(user_msg.content)
     end
+
+    test "truncation does not exceed budget when remaining < overhead" do
+      # Binary search includes A + B (min costs 4+4=8 ≤ 20).
+      # Greedy: A uses primary (17), remaining=3. B truncated.
+      # Bug: B overhead=4 > remaining 3 → total = 21 > 20.
+      result =
+        Winnow.new(budget: 20)
+        |> Winnow.add(:user,
+          priority: 500,
+          content: String.duplicate("a", 68),
+          token_count: 17,
+          fallbacks: ["a"]
+        )
+        |> Winnow.add(:user,
+          priority: 500,
+          content: String.duplicate("x", 200),
+          overflow: :truncate_end
+        )
+        |> Winnow.render()
+
+      assert result.total_tokens <= 20
+    end
   end
 
   describe "render/1 — conditions" do
@@ -539,6 +546,22 @@ defmodule Winnow.RendererTest do
       assert result.dropped == []
     end
 
+    test "condition-excluded pieces tracked in condition_excluded" do
+      result =
+        Winnow.new(budget: 100)
+        |> Winnow.add(:user,
+          priority: 500,
+          content: "Hidden",
+          token_count: 10,
+          condition: fn -> false end
+        )
+        |> Winnow.add(:user, priority: 500, content: "Visible", token_count: 10)
+        |> Winnow.render()
+
+      assert length(result.condition_excluded) == 1
+      assert hd(result.condition_excluded).content == "Hidden"
+    end
+
     test "nil condition included" do
       result =
         Winnow.new(budget: 100)
@@ -565,7 +588,7 @@ defmodule Winnow.RendererTest do
     end
 
     test "evaluated at render time, not add time" do
-      flag = :persistent_term.put({__MODULE__, :cond_flag}, false)
+      :persistent_term.put({__MODULE__, :cond_flag}, false)
 
       w =
         Winnow.new(budget: 100)
@@ -586,7 +609,6 @@ defmodule Winnow.RendererTest do
       assert [%{content: "Dynamic"}] = result2.messages
 
       # Cleanup
-      _ = flag
       :persistent_term.erase({__MODULE__, :cond_flag})
     end
   end
@@ -800,6 +822,37 @@ defmodule Winnow.RendererTest do
         LowOverheadTokenizer.count_tokens(piece.content) + LowOverheadTokenizer.message_overhead()
 
       assert piece.token_count == expected_recount
+    end
+  end
+
+  describe "render/1 — truncation with byte-per-token tokenizer" do
+    defmodule ByteTokenizer do
+      @behaviour Winnow.Tokenizer
+
+      @impl true
+      def count_tokens(text), do: byte_size(text)
+
+      @impl true
+      def message_overhead, do: 2
+    end
+
+    test "truncation respects non-standard tokenizer ratio" do
+      # ByteTokenizer: 1 byte = 1 token, overhead = 2.
+      # Budget=15, content=100 bytes. available=13, but *4 gives max_bytes=52.
+      # Truncated to 52 bytes → recount = 52+2 = 54 > 15. Bug!
+      result =
+        Winnow.new(budget: 15, tokenizer: ByteTokenizer)
+        |> Winnow.add(:user,
+          priority: 1000,
+          content: String.duplicate("x", 100),
+          overflow: :truncate_end
+        )
+        |> Winnow.render()
+
+      assert result.total_tokens <= 15
+      [piece] = result.included
+      assert piece.token_count == 15
+      assert byte_size(piece.content) == 13
     end
   end
 
@@ -1206,26 +1259,17 @@ defmodule Winnow.RendererTest do
               {9, integer(1..1000)},
               {1, constant(:infinity)}
             ]),
-          token_count <- integer(1..100)
+          content_size <- integer(1..400)
         ) do
-      {priority, token_count}
+      {priority, String.duplicate("x", content_size)}
     end
   end
 
   defp build_winnow(budget, pieces) do
     pieces
     |> Enum.with_index()
-    |> Enum.reduce(Winnow.new(budget: budget), fn {{priority, token_count}, _idx}, w ->
-      Winnow.add(w, :user, priority: priority, content: "x", token_count: token_count)
+    |> Enum.reduce(Winnow.new(budget: budget), fn {{priority, content}, _idx}, w ->
+      Winnow.add(w, :user, priority: priority, content: content, overflow: :truncate_end)
     end)
-  end
-
-  # Renders a winnow, returning nil if OversizedContentError is raised.
-  # Property tests use this since :infinity pieces can cause greedy-pass
-  # budget exhaustion that raises for regular pieces — expected behavior.
-  defp try_render(w) do
-    Winnow.render(w)
-  rescue
-    Winnow.OversizedContentError -> nil
   end
 end

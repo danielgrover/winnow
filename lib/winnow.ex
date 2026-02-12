@@ -83,6 +83,9 @@ defmodule Winnow do
       |> Keyword.put(:sequence, sequence)
 
     piece = ContentPiece.new!(piece_attrs)
+    # Append is O(n) per call, O(n²) total. Acceptable for typical prompt
+    # piece counts (tens to low hundreds). Preserves insertion order without
+    # a final reverse step, keeping the public API simple.
     %{winnow | pieces: winnow.pieces ++ [piece]}
   end
 

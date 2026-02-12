@@ -399,4 +399,28 @@ defmodule WinnowTest do
       assert "Current task" in contents
     end
   end
+
+  describe "ContentPiece validation" do
+    test "rejects invalid overflow value" do
+      assert {:error, _} =
+               Winnow.ContentPiece.new(
+                 role: :user,
+                 content: "X",
+                 priority: 500,
+                 sequence: 0,
+                 overflow: :nonsense
+               )
+    end
+
+    test "rejects invalid type value" do
+      assert {:error, _} =
+               Winnow.ContentPiece.new(
+                 role: :user,
+                 content: "X",
+                 priority: 500,
+                 sequence: 0,
+                 type: :nonsense
+               )
+    end
+  end
 end

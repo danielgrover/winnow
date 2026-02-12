@@ -18,11 +18,14 @@ defmodule Winnow.RenderResult do
   - `cache_breakpoint` — index into `messages` of the last message derived from
     a piece with `cacheable: true`, or `nil` if no cacheable pieces are included.
     Use this to place Anthropic's `cache_control` marker.
+  - `condition_excluded` — list of `ContentPiece` structs excluded by their
+    `condition` function returning `false`. These are neither in `included` nor
+    `dropped`; they were removed before the priority/budget pass.
 
   ## Example
 
       iex> %Winnow.RenderResult{}
-      %Winnow.RenderResult{messages: [], tools: [], total_tokens: 0, budget: 0, threshold: 0, included: [], dropped: [], fallbacks_used: [], cache_breakpoint: nil}
+      %Winnow.RenderResult{messages: [], tools: [], total_tokens: 0, budget: 0, threshold: 0, included: [], dropped: [], fallbacks_used: [], cache_breakpoint: nil, condition_excluded: []}
   """
 
   @type t :: %__MODULE__{
@@ -34,7 +37,8 @@ defmodule Winnow.RenderResult do
           included: [Winnow.ContentPiece.t()],
           dropped: [Winnow.ContentPiece.t()],
           fallbacks_used: [{Winnow.ContentPiece.t(), non_neg_integer()}],
-          cache_breakpoint: non_neg_integer() | nil
+          cache_breakpoint: non_neg_integer() | nil,
+          condition_excluded: [Winnow.ContentPiece.t()]
         }
 
   defstruct messages: [],
@@ -45,5 +49,6 @@ defmodule Winnow.RenderResult do
             included: [],
             dropped: [],
             fallbacks_used: [],
-            cache_breakpoint: nil
+            cache_breakpoint: nil,
+            condition_excluded: []
 end

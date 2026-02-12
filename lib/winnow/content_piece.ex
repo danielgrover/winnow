@@ -63,6 +63,8 @@ defmodule Winnow.ContentPiece do
   ]
 
   @valid_roles [:system, :user, :assistant]
+  @valid_overflows [:error, :truncate_end, :truncate_middle]
+  @valid_types [:text, :image, :tool_def, :file]
 
   @doc """
   Creates a new ContentPiece from a keyword list or map.
@@ -81,7 +83,9 @@ defmodule Winnow.ContentPiece do
 
   def new(attrs) when is_map(attrs) do
     with :ok <- validate_required(attrs),
-         :ok <- validate_role(attrs) do
+         :ok <- validate_role(attrs),
+         :ok <- validate_overflow(attrs),
+         :ok <- validate_type(attrs) do
       {:ok, struct!(__MODULE__, attrs)}
     end
   end
@@ -115,4 +119,15 @@ defmodule Winnow.ContentPiece do
 
   defp validate_role(%{role: role}) when role in @valid_roles, do: :ok
   defp validate_role(%{role: role}), do: {:error, "invalid role: #{inspect(role)}"}
+
+  defp validate_overflow(%{overflow: overflow}) when overflow in @valid_overflows, do: :ok
+
+  defp validate_overflow(%{overflow: overflow}),
+    do: {:error, "invalid overflow: #{inspect(overflow)}"}
+
+  defp validate_overflow(_attrs), do: :ok
+
+  defp validate_type(%{type: type}) when type in @valid_types, do: :ok
+  defp validate_type(%{type: type}), do: {:error, "invalid type: #{inspect(type)}"}
+  defp validate_type(_attrs), do: :ok
 end

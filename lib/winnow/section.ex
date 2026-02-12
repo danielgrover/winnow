@@ -9,7 +9,7 @@ defmodule Winnow.Section do
 
   @type t :: %__MODULE__{
           name: atom(),
-          max_tokens: pos_integer()
+          max_tokens: non_neg_integer()
         }
 
   @enforce_keys [:name, :max_tokens]
