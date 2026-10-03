@@ -21,31 +21,22 @@ defmodule Winnow.Tokenizer.ApproximateTest do
     end
 
     test "multi-byte UTF-8 uses byte_size not String.length" do
-      # "é" is 2 bytes in UTF-8, div(2, 4) = 0
-      assert Approximate.count_tokens("é") == 0
+      # Each of these differs between div(byte_size, 4) and
+      # div(String.length, 4), so counting characters would fail them.
 
-      # "héllo" = 6 bytes (h=1, é=2, l=1, l=1, o=1), div(6, 4) = 1
-      assert Approximate.count_tokens("héllo") == 1
-
-      # emoji "🎉" is 4 bytes, div(4, 4) = 1
+      # emoji "🎉" is 1 character, 4 bytes: div(4, 4) = 1 (chars would give 0)
       assert Approximate.count_tokens("🎉") == 1
 
-      # CJK character "中" is 3 bytes, div(3, 4) = 0
-      assert Approximate.count_tokens("中") == 0
-
-      # "中文测试" = 12 bytes (3 * 4), div(12, 4) = 3
+      # "中文测试" is 4 characters, 12 bytes: div(12, 4) = 3 (chars would give 1)
       assert Approximate.count_tokens("中文测试") == 3
+
+      # "éééé" is 4 characters, 8 bytes: div(8, 4) = 2 (chars would give 1)
+      assert Approximate.count_tokens("éééé") == 2
     end
 
-    property "always returns non-negative" do
-      check all(text <- string(:printable)) do
-        assert Approximate.count_tokens(text) >= 0
-      end
-    end
-
-    property "never exceeds byte_size" do
-      check all(text <- string(:printable)) do
-        assert Approximate.count_tokens(text) <= byte_size(text)
+    property "is exactly div(byte_size, 4)" do
+      check all(text <- one_of([string(:printable), string(:utf8)])) do
+        assert Approximate.count_tokens(text) == div(byte_size(text), 4)
       end
     end
   end

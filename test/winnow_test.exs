@@ -1,6 +1,17 @@
 defmodule WinnowTest do
   use ExUnit.Case, async: true
 
+  defmodule TwoByteTokenizer do
+    @moduledoc false
+    @behaviour Winnow.Tokenizer
+
+    @impl true
+    def count_tokens(text), do: div(byte_size(text), 2)
+
+    @impl true
+    def message_overhead, do: 1
+  end
+
   describe "new/1" do
     test "creates with budget and default tokenizer" do
       w = Winnow.new(budget: 4000)
@@ -10,9 +21,14 @@ defmodule WinnowTest do
       assert w.next_sequence == 0
     end
 
-    test "accepts custom tokenizer" do
-      w = Winnow.new(budget: 4000, tokenizer: Winnow.Tokenizer.Approximate)
-      assert w.tokenizer == Winnow.Tokenizer.Approximate
+    test "accepts custom tokenizer and uses it to count" do
+      result =
+        Winnow.new(budget: 4000, tokenizer: TwoByteTokenizer)
+        |> Winnow.add(:user, priority: 1, content: "12345678")
+        |> Winnow.render()
+
+      # div(8, 2) + 1 overhead (Approximate would give div(8, 4) + 4 = 6)
+      assert result.total_tokens == 5
     end
 
     test "raises without budget" do
@@ -228,12 +244,8 @@ defmodule WinnowTest do
       assert Enum.all?(w.pieces, &(&1.role == :system))
       assert Enum.all?(w.pieces, &(&1.type == :tool_def))
 
-      [first, second] = w.pieces
       # Cost basis is the whole definition
-      assert first.content =~ "get_weather"
-      assert first.content =~ "Get weather for a location"
-      assert second.content =~ "search"
-      assert second.content =~ "Search the web"
+      assert Enum.map(w.pieces, & &1.content) == Enum.map(tools, &inspect/1)
     end
 
     test "supports string-keyed tool maps" do
@@ -244,8 +256,8 @@ defmodule WinnowTest do
         |> Winnow.add_tools(tools, priority: 500)
 
       [piece] = w.pieces
-      assert piece.content =~ ~s("name" => "foo")
-      assert piece.content =~ ~s("description" => "does foo")
+      assert piece.content == inspect(hd(tools))
+      assert piece.metadata == hd(tools)
     end
 
     test "stores original tool map in metadata" do
@@ -387,7 +399,7 @@ defmodule WinnowTest do
 
     test "budget and tokenizer from left struct" do
       left = Winnow.new(budget: 1000, tokenizer: Winnow.Tokenizer.Approximate)
-      right = Winnow.new(budget: 500)
+      right = Winnow.new(budget: 500, tokenizer: TwoByteTokenizer)
 
       merged = Winnow.merge(left, right)
 
@@ -406,8 +418,8 @@ defmodule WinnowTest do
 
       merged = Winnow.merge(left, right)
 
-      assert Map.has_key?(merged.sections, :memory)
-      assert Map.has_key?(merged.sections, :tools)
+      assert %{memory: %{max_tokens: 200}, tools: %{max_tokens: 100}} = merged.sections
+      assert map_size(merged.sections) == 2
     end
 
     test "merge where both sides define same section — right overwrites left" do
@@ -431,10 +443,7 @@ defmodule WinnowTest do
 
       right = Winnow.new(budget: 500)
 
-      merged = Winnow.merge(left, right)
-
-      assert [_] = merged.pieces
-      assert hd(merged.pieces).content == "A"
+      assert Winnow.merge(left, right) == left
     end
 
     test "end-to-end merge + render" do
@@ -453,87 +462,10 @@ defmodule WinnowTest do
         |> Winnow.merge(task)
         |> Winnow.render()
 
-      assert result.total_tokens <= 25
-      # System + task fit (20), memory dropped at budget 25 if all 3 = 30 > 25
-      contents = Enum.map(result.messages, & &1.content)
-      assert "System" in contents
-      assert "Current task" in contents
-    end
-  end
-
-  describe "ContentPiece validation" do
-    test "rejects invalid overflow value" do
-      assert {:error, _} =
-               Winnow.ContentPiece.new(
-                 role: :user,
-                 content: "X",
-                 priority: 500,
-                 sequence: 0,
-                 overflow: :nonsense
-               )
-    end
-
-    test "rejects invalid type value" do
-      assert {:error, _} =
-               Winnow.ContentPiece.new(
-                 role: :user,
-                 content: "X",
-                 priority: 500,
-                 sequence: 0,
-                 type: :nonsense
-               )
-    end
-
-    test "rejects non-integer, non-infinity priority" do
-      assert {:error, _} =
-               Winnow.ContentPiece.new(
-                 role: :user,
-                 content: "X",
-                 priority: "high",
-                 sequence: 0
-               )
-    end
-
-    test "rejects float priority" do
-      assert {:error, _} =
-               Winnow.ContentPiece.new(
-                 role: :user,
-                 content: "X",
-                 priority: 5.0,
-                 sequence: 0
-               )
-    end
-
-    test "accepts :infinity priority" do
-      assert {:ok, piece} =
-               Winnow.ContentPiece.new(
-                 role: :user,
-                 content: "X",
-                 priority: :infinity,
-                 sequence: 0
-               )
-
-      assert piece.priority == :infinity
-    end
-
-    test "rejects non-binary content" do
-      assert {:error, _} =
-               Winnow.ContentPiece.new(
-                 role: :user,
-                 content: 123,
-                 priority: 500,
-                 sequence: 0
-               )
-    end
-
-    test "rejects list content" do
-      assert {:error, _} =
-               Winnow.ContentPiece.new(
-                 role: :user,
-                 content: ["hello"],
-                 priority: 500,
-                 sequence: 0
-               )
+      # System (1000) + task (900) = 20 fit; adding memory (500) would be 30 > 25
+      assert Enum.map(result.messages, & &1.content) == ["System", "Current task"]
+      assert [%{content: "Memory item"}] = result.dropped
+      assert result.total_tokens == 20
     end
   end
 
@@ -676,12 +608,75 @@ defmodule WinnowTest do
       end
     end
 
+    test "duplicated options raise naming them" do
+      assert_raise ArgumentError, ~r/duplicate option\(s\) \[:priority\]/, fn ->
+        Winnow.add(Winnow.new(budget: 10), :user, priority: 1, content: "x", priority: 2)
+      end
+    end
+
+    test "add_each items and add_tools tools must be lists" do
+      w = Winnow.new(budget: 10)
+
+      assert_raise ArgumentError, ~r/invalid items: 5/, fn ->
+        Winnow.add_each(w, :user, items: 5, priority: 1, formatter: &to_string/1)
+      end
+
+      assert_raise ArgumentError, ~r/invalid tools: %\{name: "a"\}/, fn ->
+        # apply/3 keeps the type checker from flagging this deliberately bad call
+        # credo:disable-for-next-line Credo.Check.Refactor.Apply
+        apply(Winnow, :add_tools, [w, %{name: "a"}, [priority: 1]])
+      end
+    end
+
+    test "add_each builds large batches in linear time" do
+      {micros, w} =
+        :timer.tc(fn ->
+          Winnow.add_each(
+            Winnow.new(budget: 10),
+            :user,
+            items: Enum.to_list(1..20_000),
+            priority: 1,
+            formatter: &to_string/1
+          )
+        end)
+
+      assert Enum.map(w.pieces, & &1.sequence) == Enum.to_list(0..19_999)
+      assert micros < 500_000
+    end
+
     test "maps instead of keyword lists raise ArgumentError" do
       assert_raise ArgumentError, ~r/expected a keyword list/, fn ->
         # apply/3 keeps the type checker from flagging this deliberately bad call
         # credo:disable-for-next-line Credo.Check.Refactor.Apply
         apply(Winnow, :new, [%{budget: 10}])
       end
+    end
+
+    test "add_each rejects :metadata together with :metadata_fn" do
+      assert_raise ArgumentError, ~r/:metadata or :metadata_fn, not both/, fn ->
+        Winnow.new(budget: 100)
+        |> Winnow.add_each(:user,
+          items: [1],
+          priority: 1,
+          formatter: &to_string/1,
+          metadata: :shared,
+          metadata_fn: &{:item, &1}
+        )
+      end
+    end
+
+    test "a :tool_def piece added via add/3 needs metadata (or it would vanish)" do
+      assert_raise ArgumentError, ~r/missing metadata for :tool_def/, fn ->
+        Winnow.new(budget: 100) |> Winnow.add(:system, priority: 1, content: "t", type: :tool_def)
+      end
+
+      result =
+        Winnow.new(budget: 100)
+        |> Winnow.add(:system, priority: 1, content: "t", type: :tool_def, metadata: %{name: "t"})
+        |> Winnow.render()
+
+      assert result.tools == [%{name: "t"}]
+      assert result.messages == []
     end
 
     test "add_each rejects conflicting or per-batch-meaningless options" do

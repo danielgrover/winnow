@@ -25,8 +25,8 @@ defmodule Winnow.RendererTest do
 
     test "single piece that doesn't fit — threshold above it" do
       pieces = [piece(priority: 500, token_count: 200)]
-      # Threshold should be above 500 so the piece is excluded
-      assert Renderer.find_threshold(pieces, 100, @tokenizer) > 500
+      # Nothing fits, so the threshold is one above the highest level
+      assert Renderer.find_threshold(pieces, 100, @tokenizer) == 501
     end
 
     test "two pieces, both fit — threshold is lowest priority" do
@@ -67,8 +67,10 @@ defmodule Winnow.RendererTest do
         piece(priority: 500, token_count: 30, sequence: 2)
       ]
 
-      # All same priority — all included or all excluded
+      # A level is admitted or rejected as a whole: 90 fits in 100...
       assert Renderer.find_threshold(pieces, 100, @tokenizer) == 500
+      # ...but at 80 the whole level is rejected, even though two would fit
+      assert Renderer.find_threshold(pieces, 80, @tokenizer) == 501
     end
 
     test "exact budget fit" do
@@ -121,11 +123,15 @@ defmodule Winnow.RendererTest do
     test "zero budget drops everything except reservations" do
       result =
         Winnow.new(budget: 0)
+        |> Winnow.reserve(:r, tokens: 0)
         |> Winnow.add(:system, priority: 1000, content: "Hello", token_count: 10)
         |> Winnow.render()
 
+      assert [%{name: :r}] = result.included
+      assert [%{content: "Hello"}] = result.dropped
       assert result.messages == []
       assert result.total_tokens == 0
+      assert result.threshold == 1001
     end
   end
 
@@ -320,16 +326,20 @@ defmodule Winnow.RendererTest do
         assert result.total_tokens <= budget
 
         for %{content: content} <- result.messages, content != original do
-          case String.split(content, " [...] ", parts: 2) do
-            [prefix, suffix] when mode == :truncate_middle ->
+          case {mode, String.split(content, " [...] ", parts: 2)} do
+            {:truncate_middle, [prefix, suffix]} ->
               p = String.graphemes(prefix)
               q = String.graphemes(suffix)
+              assert p != [] and q != []
               assert p == Enum.take(graphemes, length(p))
               assert q == Enum.take(graphemes, -length(q))
 
-            [prefix] ->
+            {:truncate_end, [prefix]} ->
               p = String.graphemes(prefix)
               assert p == Enum.take(graphemes, length(p))
+
+            other ->
+              flunk("#{mode} produced the wrong shape: #{inspect(other)}")
           end
         end
       end
@@ -366,15 +376,57 @@ defmodule Winnow.RendererTest do
         by_seq = Map.new(build.(0).pieces, &{&1.sequence, &1})
 
         for l <- lost do
-          lost_piece = by_seq[l]
+          assert Enum.any?(gained, &outranks?(by_seq[&1], by_seq[l])),
+                 "piece #{l} (priority #{by_seq[l].priority}) lost with more budget"
+        end
+      end
+    end
+  end
 
-          assert Enum.any?(gained, fn g ->
-                   gained_piece = by_seq[g]
+  describe "property-based — section monotonicity" do
+    property "raising a section's max_tokens only displaces a piece for one at least as important" do
+      check all(
+              budget <- integer(0..400),
+              max_tokens <- integer(0..300),
+              extra <- integer(1..200),
+              tokenizer <-
+                member_of([
+                  Winnow.Tokenizer.Approximate,
+                  __MODULE__.ByteTokenizer,
+                  __MODULE__.ZeroOverheadByteTokenizer
+                ]),
+              pieces <-
+                list_of(
+                  tuple({mixed_piece_generator(), member_of([nil, :s, :t])}),
+                  min_length: 1,
+                  max_length: 12
+                ),
+              max_runs: 1_000
+            ) do
+        build = fn m ->
+          Enum.reduce(
+            pieces,
+            Winnow.new(budget: budget, tokenizer: tokenizer)
+            |> Winnow.section(:s, max_tokens: m)
+            |> Winnow.section(:t, max_tokens: 50),
+            fn {opts, section}, acc ->
+              opts = if section, do: Keyword.put(opts, :section, section), else: opts
+              Winnow.add(acc, :user, opts)
+            end
+          )
+        end
 
-                   gained_piece.priority > lost_piece.priority or
-                     (gained_piece.priority == lost_piece.priority and g < l)
-                 end),
-                 "piece #{l} (priority #{lost_piece.priority}) lost with more budget"
+        small = build.(max_tokens) |> Winnow.render()
+        large = build.(max_tokens + extra) |> Winnow.render()
+
+        seqs = fn result -> MapSet.new(result.included, & &1.sequence) end
+        lost = MapSet.difference(seqs.(small), seqs.(large))
+        gained = MapSet.difference(seqs.(large), seqs.(small))
+        by_seq = Map.new(build.(0).pieces, &{&1.sequence, &1})
+
+        for l <- lost do
+          assert Enum.any?(gained, &outranks?(by_seq[&1], by_seq[l])),
+                 "piece #{l} (priority #{by_seq[l].priority}) lost when a section grew"
         end
       end
     end
@@ -483,9 +535,9 @@ defmodule Winnow.RendererTest do
     end
 
     test "nothing fits — piece dropped when primary and all fallbacks too large" do
-      # A has a small fallback making binary search include the level.
-      # B's primary and fallback are both too large for remaining budget.
-      # B has empty content so overflow :error drops it instead of raising.
+      # B's primary (30) and its only fallback (29) are too large for the
+      # budget, so admission rejects B's level... but A shares the level.
+      # Put B one level lower so A is admitted and B is rejected on its own.
       result =
         Winnow.new(budget: 25)
         |> Winnow.add(:user,
@@ -495,21 +547,23 @@ defmodule Winnow.RendererTest do
           fallbacks: ["tiny"]
         )
         |> Winnow.add(:user,
-          priority: 500,
-          content: "",
-          token_count: 12,
+          priority: 400,
+          content: String.duplicate("b", 120),
           fallbacks: [String.duplicate("x", 100)]
         )
         |> Winnow.render()
 
-      # A's primary fits (20 <= 25), uses primary. Remaining=5.
-      # B primary=12>5, fallback too large, empty content → dropped.
-      assert [_] = result.messages
+      assert [%{content: content}] = result.messages
+      assert content == String.duplicate("a", 80)
+      assert [%{priority: 400}] = result.dropped
+      assert result.threshold == 500
+      assert result.total_tokens == 20
     end
 
     test "fallback preserves role and sequence" do
       result =
         Winnow.new(budget: 15)
+        |> Winnow.add(:system, priority: 1000, content: "Sys", token_count: 5)
         |> Winnow.add(:assistant,
           priority: 500,
           content: "Long response",
@@ -518,10 +572,9 @@ defmodule Winnow.RendererTest do
         )
         |> Winnow.render()
 
-      [msg] = result.messages
-      assert msg.role == :assistant
-      [piece] = result.included
-      assert piece.sequence == 0
+      assert [_, %{role: :assistant, content: "Short"}] = result.messages
+      assert [_, %{sequence: 1, role: :assistant}] = result.included
+      assert result.total_tokens == 10
     end
 
     test "multiple pieces with fallbacks" do
@@ -542,10 +595,11 @@ defmodule Winnow.RendererTest do
         )
         |> Winnow.render()
 
-      contents = Enum.map(result.messages, & &1.content)
-      assert "S" in contents
-      assert result.fallbacks_used != []
-      assert result.total_tokens <= 25
+      # Min costs 5 + 4 + 4 = 13 admit the level. In sequence order A gets its
+      # primary (15) since B's minimum (4) is still reserved; B gets "B" (4).
+      assert Enum.map(result.messages, & &1.content) == ["S", "Long A", "B"]
+      assert [{%{content: "Long B"}, 0}] = result.fallbacks_used
+      assert result.total_tokens == 24
     end
   end
 
@@ -569,7 +623,7 @@ defmodule Winnow.RendererTest do
         )
         |> Winnow.render()
 
-      assert result.total_tokens <= 25
+      assert result.total_tokens == 17
       assert [_, _] = result.included
       assert [{%{token_count: 20}, 0}] = result.fallbacks_used
     end
@@ -602,9 +656,10 @@ defmodule Winnow.RendererTest do
         )
         |> Winnow.render()
 
-      assert result.total_tokens <= 30
-      assert [_] = result.messages
-      assert byte_size(hd(result.messages).content) < 200
+      # 30 - 10 reserved - 4 overhead = 16 content tokens = up to 67 bytes
+      assert result.total_tokens == 30
+      assert [%{content: content}] = result.messages
+      assert content == String.duplicate("x", 67)
     end
 
     test ":truncate_middle preserves start and end with marker" do
@@ -621,11 +676,9 @@ defmodule Winnow.RendererTest do
         )
         |> Winnow.render()
 
-      assert result.total_tokens <= 40
-      user_msg = hd(result.messages)
-      assert user_msg.content =~ "[...]"
-      assert String.starts_with?(user_msg.content, "a")
-      assert String.ends_with?(user_msg.content, "z")
+      assert result.total_tokens == 40
+      assert [%{content: content}] = result.messages
+      assert content == String.duplicate("a", 50) <> " [...] " <> String.duplicate("z", 50)
     end
 
     test "non-oversized piece with overflow option not truncated" do
@@ -656,31 +709,27 @@ defmodule Winnow.RendererTest do
         )
         |> Winnow.render()
 
-      assert result.total_tokens <= 30
-      user_msg = hd(result.messages)
-      assert String.valid?(user_msg.content)
+      # 21 content tokens allow 87 bytes; the cut backs off to 86 so it
+      # doesn't split a 2-byte "é"
+      assert result.total_tokens == 30
+      assert [%{content: content}] = result.messages
+      assert content == String.duplicate("é", 43)
     end
 
-    test "truncation does not exceed budget when remaining < overhead" do
-      # Binary search includes A + B (min costs 4+4=8 ≤ 20).
-      # Greedy: A uses primary (17), remaining=3. B truncated.
-      # Bug: B overhead=4 > remaining 3 → total = 21 > 20.
-      result =
+    test "truncation with less than message overhead left raises for :infinity" do
+      # Both :infinity pieces are mandatory. Visiting the truncatable one
+      # first (lower sequence) leaves it 20 - 18 = 2 < overhead 4: it can't
+      # carry content, and an :infinity piece must not vanish.
+      assert_raise Winnow.OversizedContentError, ~r/smallest truncation/, fn ->
         Winnow.new(budget: 20)
         |> Winnow.add(:user,
-          priority: 500,
-          content: String.duplicate("a", 68),
-          token_count: 17,
-          fallbacks: ["a"]
-        )
-        |> Winnow.add(:user,
-          priority: 500,
+          priority: :infinity,
           content: String.duplicate("x", 200),
           overflow: :truncate_end
         )
+        |> Winnow.reserve(:response, tokens: 18)
         |> Winnow.render()
-
-      assert result.total_tokens <= 20
+      end
     end
   end
 
@@ -813,10 +862,9 @@ defmodule Winnow.RendererTest do
         |> Winnow.render()
 
       # Section budget 15: only Mem1 (10) fits. Mem2 dropped.
-      contents = Enum.map(result.messages, & &1.content)
-      assert "Mem1" in contents
-      refute "Mem2" in contents
-      assert result.total_tokens <= 100
+      assert Enum.map(result.messages, & &1.content) == ["Mem1"]
+      assert [%{content: "Mem2"}] = result.dropped
+      assert result.total_tokens == 10
     end
 
     test "non-sectioned pieces unaffected by section budget" do
@@ -970,38 +1018,12 @@ defmodule Winnow.RendererTest do
         )
         |> Winnow.render()
 
-      assert result.total_tokens <= 12
+      assert result.total_tokens == 12
       [piece] = result.included
       # With overhead=2: 10 tokens for content. div(byte_size, 4) <= 10 allows
       # up to 43 bytes; hardcoded overhead 4 would allow at most 35.
       assert byte_size(piece.content) == 43
       assert piece.token_count == 12
-    end
-
-    test "truncated piece recount uses tokenizer, not div(byte_size, 4)" do
-      # Use a tokenizer where count_tokens differs from div(byte_size, 4).
-      # With multi-byte chars like "é" (2 bytes each):
-      #   div(byte_size, 4) would undercount compared to byte_size / 4
-      #   The Approximate tokenizer would give div(byte_size, 4)
-      # We use LowOverheadTokenizer (overhead=2, same count_tokens as Approximate)
-      # to verify the recount calls count_tokens, not a hardcoded formula.
-      content = String.duplicate("x", 200)
-
-      result =
-        Winnow.new(budget: 12, tokenizer: LowOverheadTokenizer)
-        |> Winnow.add(:user,
-          priority: 1000,
-          content: content,
-          overflow: :truncate_end
-        )
-        |> Winnow.render()
-
-      [piece] = result.included
-
-      expected_recount =
-        LowOverheadTokenizer.count_tokens(piece.content) + LowOverheadTokenizer.message_overhead()
-
-      assert piece.token_count == expected_recount
     end
   end
 
@@ -1028,9 +1050,8 @@ defmodule Winnow.RendererTest do
     end
 
     test "truncation respects non-standard tokenizer ratio" do
-      # ByteTokenizer: 1 byte = 1 token, overhead = 2.
-      # Budget=15, content=100 bytes. available=13, but *4 gives max_bytes=52.
-      # Truncated to 52 bytes → recount = 52+2 = 54 > 15. Bug!
+      # ByteTokenizer: 1 byte = 1 token, overhead = 2. Budget 15 leaves 13
+      # content tokens = 13 bytes (a 4 bytes/token guess would overshoot).
       result =
         Winnow.new(budget: 15, tokenizer: ByteTokenizer)
         |> Winnow.add(:user,
@@ -1040,7 +1061,7 @@ defmodule Winnow.RendererTest do
         )
         |> Winnow.render()
 
-      assert result.total_tokens <= 15
+      assert result.total_tokens == 15
       [piece] = result.included
       assert piece.token_count == 15
       assert byte_size(piece.content) == 13
@@ -1118,36 +1139,6 @@ defmodule Winnow.RendererTest do
   end
 
   describe "render/1 — binary search / fallback imprecision" do
-    test "binary search optimistic, greedy resolves to fallback" do
-      # A: primary=15, fallback="a" (~4 tokens)
-      # B: primary=12, fallback="b" (~4 tokens)
-      # Budget=20. Binary search min costs: A=min(15,4)=4, B=min(12,4)=4 → 8, fits.
-      # Greedy: A primary=15, fits (remaining=5). B primary=12>5.
-      # B fallback "b" = div(1,4)+4 = 4 tokens. 4 <= 5? Yes!
-      result =
-        Winnow.new(budget: 20)
-        |> Winnow.add(:user,
-          priority: 500,
-          content: String.duplicate("a", 60),
-          token_count: 15,
-          fallbacks: ["a"]
-        )
-        |> Winnow.add(:user,
-          priority: 500,
-          content: String.duplicate("b", 48),
-          token_count: 12,
-          fallbacks: ["b"]
-        )
-        |> Winnow.render()
-
-      assert result.total_tokens <= 20
-      assert [_, _] = result.included
-      # B used fallback
-      assert result.fallbacks_used != []
-      {fb_piece, _idx} = hd(result.fallbacks_used)
-      assert fb_piece.content == String.duplicate("b", 48)
-    end
-
     test "fallback used when primary fits by threshold but not by greedy budget" do
       # A: primary=15, fallback="aa" (~4 tokens)
       # B: primary=10, fallback="bb" (~4 tokens)
@@ -1179,6 +1170,65 @@ defmodule Winnow.RendererTest do
   end
 
   describe "render/1 — truncation edge cases" do
+    test "conjuncts in any script the Unicode tables cover stay whole" do
+      # Myanmar, Sinhala, Khmer conjunct runs (consonant + virama + consonant)
+      for {name, unit, cons} <- [
+            {"Myanmar", "က္", "က"},
+            {"Sinhala", "ක්\u200D", "ක"},
+            {"Khmer", "ក្", "ក"},
+            {"Devanagari", "क्", "क"}
+          ],
+          budget <- [20, 34, 60] do
+        content = "a" <> String.duplicate(unit, 30) <> cons <> String.duplicate("z", 400)
+
+        result =
+          Winnow.new(budget: budget)
+          |> Winnow.add(:user, priority: 1, content: content, overflow: :truncate_end)
+          |> Winnow.render()
+
+        for %{content: cut} <- result.messages do
+          g = String.graphemes(cut)
+
+          assert g == Enum.take(String.graphemes(content), length(g)),
+                 "#{name} split at #{budget}"
+        end
+      end
+    end
+
+    test "vowel-sign and ZWJ runs truncate quickly" do
+      for content <- [String.duplicate("का", 100_000), String.duplicate("a\u200D", 150_000)],
+          mode <- [:truncate_end, :truncate_middle] do
+        {micros, result} =
+          :timer.tc(fn ->
+            Winnow.new(budget: 5000)
+            |> Winnow.add(:user, priority: 1, content: content, overflow: mode)
+            |> Winnow.render()
+          end)
+
+        assert [_] = result.messages
+        assert micros < 500_000
+      end
+    end
+
+    test ":truncate_middle output never shrinks as the budget grows" do
+      e41 = "e" <> String.duplicate("\u0301", 20)
+      e61 = "e" <> String.duplicate("\u0301", 30)
+      content = "a" <> e41 <> String.duplicate("m", 30) <> e61 <> "z"
+
+      sizes =
+        for budget <- 12..40 do
+          result =
+            Winnow.new(budget: budget)
+            |> Winnow.add(:user, priority: 1, content: content, overflow: :truncate_middle)
+            |> Winnow.render()
+
+          result.messages |> Enum.map(&byte_size(&1.content)) |> Enum.sum()
+        end
+
+      assert sizes == Enum.sort(sizes)
+      assert List.last(sizes) == byte_size(content)
+    end
+
     test "a truncatable :infinity piece that can't fit raises rather than vanishing" do
       assert_raise Winnow.OversizedContentError, ~r/smallest truncation/, fn ->
         Winnow.new(budget: 3)
@@ -1200,8 +1250,10 @@ defmodule Winnow.RendererTest do
         |> Winnow.render()
 
       [%{content: truncated}] = result.messages
-      assert String.starts_with?(truncated, "👨‍👩‍👧‍👦 [...] a")
-      assert result.total_tokens <= 40
+      # 40 - 2 overhead = 38 bytes: the 25-byte family emoji, the 7-byte
+      # marker, and 6 bytes of suffix
+      assert truncated == "👨‍👩‍👧‍👦 [...] aaaaaa"
+      assert result.total_tokens == 40
     end
 
     test "empty content can't claim a free truncation" do
@@ -1301,7 +1353,7 @@ defmodule Winnow.RendererTest do
         |> Winnow.render()
 
       assert [%{content: truncated}] = result.messages
-      assert result.total_tokens <= 200
+      assert result.total_tokens == 200
       assert String.valid?(truncated)
       assert truncated =~ " [...] "
       assert String.starts_with?(truncated, "héllo")
@@ -1345,10 +1397,10 @@ defmodule Winnow.RendererTest do
       assert [%{metadata: {:story, 41}}] = result.dropped
     end
 
-    test "truncate_middle never emits a bare marker" do
-      # 1 token of room (4 bytes) is less than the 7-byte marker plus content.
-      result =
-        Winnow.new(budget: 15)
+    test "truncate_middle at its tightest budget keeps content on both sides" do
+      # Smallest middle form is "s [...] s" (9 bytes = 2 tokens + 4 overhead).
+      render = fn budget ->
+        Winnow.new(budget: budget)
         |> Winnow.add(:system, priority: 100, content: "sys", token_count: 10)
         |> Winnow.add(:user,
           priority: 1,
@@ -1356,27 +1408,25 @@ defmodule Winnow.RendererTest do
           overflow: :truncate_middle
         )
         |> Winnow.render()
+      end
 
-      assert Enum.map(result.messages, & &1.content) == ["sys"]
-      assert [%{priority: 1}] = result.dropped
+      # One token short: the piece is dropped rather than emitting a bare or
+      # one-sided marker
+      assert Enum.map(render.(15).messages, & &1.content) == ["sys"]
+      assert Enum.map(render.(16).messages, & &1.content) == ["sys", "ss [...] ss"]
     end
 
-    test "truncate_middle with content shorter than marker doesn't crash" do
-      # Content "ab" = 2 bytes. Marker " [...] " = 7 bytes.
-      # Budget allows ~3 tokens content + 4 overhead = ~16 budget needed for full content.
-      # Budget 5 forces truncation.
-      result =
-        Winnow.new(budget: 5)
-        |> Winnow.add(:user,
-          priority: 1000,
-          content: "ab",
-          overflow: :truncate_middle
-        )
+    test "content too short to middle-truncate is kept whole or dropped, never mangled" do
+      # "ab" can't carry " [...] " with content on both sides in fewer bytes
+      # than itself, so its only form is the primary (2 bytes + 2 overhead).
+      render = fn budget ->
+        Winnow.new(budget: budget, tokenizer: __MODULE__.ByteTokenizer)
+        |> Winnow.add(:user, priority: 1, content: "ab", overflow: :truncate_middle)
         |> Winnow.render()
+      end
 
-      assert result.total_tokens <= 5
-      [piece] = result.included
-      assert String.valid?(piece.content)
+      assert %{messages: [], dropped: [%{content: "ab"}]} = render.(3)
+      assert %{messages: [%{content: "ab"}], total_tokens: 4} = render.(4)
     end
 
     test "truncate_end with full budget consumed — piece excluded by threshold" do
@@ -1412,16 +1462,16 @@ defmodule Winnow.RendererTest do
       assert result.dropped == []
     end
 
-    test "budget = 1 with piece overhead > 1 — dropped by greedy pass" do
-      # Approximate tokenizer: "x" → div(1,4)+4 = 4 tokens. Budget = 1.
+    test "budget = 1 with piece overhead > 1 — rejected at admission" do
+      # Approximate: "x" → div(1, 4) + 4 = 4 tokens > budget 1.
       result =
         Winnow.new(budget: 1)
         |> Winnow.add(:user, priority: 1000, content: "x")
         |> Winnow.render()
 
-      # Token count = 4 > budget 1. Threshold should exclude it.
       assert result.messages == []
-      assert result.dropped != []
+      assert [%{content: "x"}] = result.dropped
+      assert result.threshold == 1001
     end
 
     test "mix of :infinity and regular priorities" do
@@ -1441,6 +1491,42 @@ defmodule Winnow.RendererTest do
   end
 
   describe "render/1 — section edge cases" do
+    test "a section doesn't spend its room on a piece the budget can't hold" do
+      # A (16 tokens, omittable) never fits the budget of 10. Growing the
+      # section enough to admit A must not push P out in favour of L.
+      render = fn max_tokens ->
+        Winnow.new(budget: 10)
+        |> Winnow.section(:s, max_tokens: max_tokens)
+        |> Winnow.add(:user,
+          priority: 2,
+          content: String.duplicate("a", 48),
+          fallbacks: [""],
+          section: :s
+        )
+        |> Winnow.add(:user, priority: 1, content: "pppp", section: :s)
+        |> Winnow.add(:user, priority: 0, content: String.duplicate("l", 24))
+        |> Winnow.render()
+      end
+
+      for max_tokens <- [15, 16, 100] do
+        assert Enum.map(render.(max_tokens).messages, & &1.content) == ["pppp"]
+      end
+    end
+
+    test "a section whose level overflows closes; the rest of the prompt carries on" do
+      result =
+        Winnow.new(budget: 100)
+        |> Winnow.section(:s, max_tokens: 10)
+        |> Winnow.add(:user, priority: 5, content: "big", token_count: 20, section: :s)
+        |> Winnow.add(:user, priority: 4, content: "small", token_count: 5, section: :s)
+        |> Winnow.add(:user, priority: 3, content: "main", token_count: 30)
+        |> Winnow.render()
+
+      assert Enum.map(result.messages, & &1.content) == ["main"]
+      assert Enum.map(result.dropped, & &1.content) |> Enum.sort() == ["big", "small"]
+      assert result.threshold == 3
+    end
+
     test "a section's fallback choice is a cap, not a commitment" do
       # The section can afford fallback 0 ("b" x 40), but the main budget can
       # only afford fallback 1 ("c"); the main pass must still be able to pick it.
@@ -1477,9 +1563,10 @@ defmodule Winnow.RendererTest do
         )
         |> Winnow.render()
 
-      for %{content: c} <- result.messages do
-        assert Enum.count_until(String.split(c, "["), 3) <= 2, "nested marker in #{inspect(c)}"
-      end
+      # Smallest middle form is 25 + 7 + 1 = 33 bytes > 15
+      assert result.messages == []
+      assert [%{content: ^content}] = result.dropped
+      assert result.total_tokens == 0
     end
 
     test "section and main pass truncate once, from the original" do
@@ -1636,6 +1723,18 @@ defmodule Winnow.RendererTest do
   end
 
   describe "render/1 — fallback edge cases" do
+    test "threshold when the top level holds only omittable pieces" do
+      # The level's (empty) mandatory set fits, so it counts as admitted even
+      # though its one piece is skipped.
+      result =
+        Winnow.new(budget: 10)
+        |> Winnow.add(:user, priority: 100, content: "big", token_count: 50, fallbacks: [""])
+        |> Winnow.render()
+
+      assert result.included == []
+      assert result.threshold == 100
+    end
+
     test "omission never makes room for a lower-priority piece" do
       for budget <- [100, 101, 150] do
         result =
@@ -1723,25 +1822,15 @@ defmodule Winnow.RendererTest do
         )
         |> Winnow.render()
 
-      # Remaining after Sys = 5. Primary=50, fb0=large, fb1="ok"=div(2,4)+4=4+1=5, fits!
-      contents = Enum.map(result.messages, & &1.content)
-      assert "ok" in contents
-      assert [_] = result.fallbacks_used
-      {_piece, index} = hd(result.fallbacks_used)
-      assert index == 1
+      # Remaining after Sys = 5. Primary = 50, fb0 = 54, fb1 "ok" = div(2, 4) + 4 = 4
+      # fits, fb2 isn't reached.
+      assert Enum.map(result.messages, & &1.content) == ["Sys", "ok"]
+      assert [{%{token_count: 50}, 1}] = result.fallbacks_used
+      assert result.total_tokens == 14
     end
   end
 
   describe "render/1 — tightened assertions" do
-    test "single piece exact token count" do
-      result =
-        Winnow.new(budget: 100)
-        |> Winnow.add(:system, priority: 1000, content: "Hello", token_count: 10)
-        |> Winnow.render()
-
-      assert result.total_tokens == 10
-    end
-
     test "two pieces exact token count" do
       result =
         Winnow.new(budget: 100)
@@ -1772,30 +1861,6 @@ defmodule Winnow.RendererTest do
 
       assert result.total_tokens == 20
     end
-
-    test "multiple pieces with fallbacks — exact total" do
-      result =
-        Winnow.new(budget: 25)
-        |> Winnow.add(:system, priority: 1000, content: "S", token_count: 5)
-        |> Winnow.add(:user,
-          priority: 1000,
-          content: "Long A",
-          token_count: 15,
-          fallbacks: ["A"]
-        )
-        |> Winnow.add(:user,
-          priority: 1000,
-          content: "Long B",
-          token_count: 15,
-          fallbacks: ["B"]
-        )
-        |> Winnow.render()
-
-      # S=5. Greedy: A primary=15, fits (remaining=20). B primary=15>5.
-      # B fallback "B" = div(1,4)+4 = 0+4 = 4. Fits!
-      # Total: 5 + 15 + 4 = 24.
-      assert result.total_tokens == 24
-    end
   end
 
   describe "render/1 — greedy pass respects priority and pending minimums" do
@@ -1810,7 +1875,10 @@ defmodule Winnow.RendererTest do
         |> Winnow.reserve(:response, tokens: 50)
         |> Winnow.render()
 
-      assert result.total_tokens <= 100
+      # 100 - 50 reserved - 4 overhead = 46 content tokens = 187 bytes
+      assert result.total_tokens == 100
+      assert [%{content: content}] = result.messages
+      assert content == String.duplicate("a", 187)
       assert Enum.any?(result.included, &(&1.name == :response))
       assert result.dropped == []
     end
@@ -1826,7 +1894,8 @@ defmodule Winnow.RendererTest do
         |> Winnow.add(:user, priority: 20, content: String.duplicate("c", 224))
         |> Winnow.render()
 
-      assert result.total_tokens <= 100
+      # 60 + "short" (1 + 4)
+      assert result.total_tokens == 65
       assert [_, %{content: "short"}] = result.included |> Enum.sort_by(&(-&1.priority))
       assert [{%{priority: 10}, 0}] = result.fallbacks_used
       # Output still ordered by sequence
@@ -1880,6 +1949,19 @@ defmodule Winnow.RendererTest do
             ])
         ) do
       {priority, String.duplicate("x", content_size), cacheable, fallback}
+    end
+  end
+
+  # May `winner` take `loser`'s place when room grows? Higher priority, or at
+  # the same priority: a non-omittable piece over an omittable one (levels
+  # admit those first), else the earlier sequence.
+  defp outranks?(winner, loser) do
+    omittable? = &("" in &1.fallbacks)
+
+    cond do
+      winner.priority != loser.priority -> winner.priority > loser.priority
+      omittable?.(winner) != omittable?.(loser) -> omittable?.(loser)
+      true -> winner.sequence < loser.sequence
     end
   end
 

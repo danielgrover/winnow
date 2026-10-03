@@ -16,11 +16,8 @@ defmodule Winnow.ContentPieceTest do
       assert piece.sequence == 0
     end
 
-    test "accepts keyword list" do
-      assert {:ok, piece} =
-               ContentPiece.new(role: :user, content: "Hi", priority: 500, sequence: 1)
-
-      assert piece.role == :user
+    test "accepts keyword list, same as a map" do
+      assert ContentPiece.new(Enum.to_list(@valid_attrs)) == ContentPiece.new(@valid_attrs)
     end
 
     test "sets defaults" do
@@ -55,35 +52,34 @@ defmodule Winnow.ContentPieceTest do
     end
 
     test "accepts condition function" do
-      attrs = Map.put(@valid_attrs, :condition, fn -> true end)
-      assert {:ok, piece} = ContentPiece.new(attrs)
-      assert is_function(piece.condition, 0)
+      condition = fn -> true end
+      assert {:ok, piece} = ContentPiece.new(Map.put(@valid_attrs, :condition, condition))
+      assert piece.condition == condition
     end
 
     test "error on missing role" do
-      assert {:error, msg} = ContentPiece.new(Map.delete(@valid_attrs, :role))
-      assert msg =~ "role"
+      assert ContentPiece.new(Map.delete(@valid_attrs, :role)) ==
+               {:error, "missing required fields: [:role]"}
     end
 
     test "error on missing content" do
-      assert {:error, msg} = ContentPiece.new(Map.delete(@valid_attrs, :content))
-      assert msg =~ "content"
+      assert ContentPiece.new(Map.delete(@valid_attrs, :content)) ==
+               {:error, "missing required fields: [:content]"}
     end
 
     test "error on missing priority" do
-      assert {:error, msg} = ContentPiece.new(Map.delete(@valid_attrs, :priority))
-      assert msg =~ "priority"
+      assert ContentPiece.new(Map.delete(@valid_attrs, :priority)) ==
+               {:error, "missing required fields: [:priority]"}
     end
 
     test "error on missing sequence" do
-      assert {:error, msg} = ContentPiece.new(Map.delete(@valid_attrs, :sequence))
-      assert msg =~ "sequence"
+      assert ContentPiece.new(Map.delete(@valid_attrs, :sequence)) ==
+               {:error, "missing required fields: [:sequence]"}
     end
 
     test "error on missing multiple fields" do
-      assert {:error, msg} = ContentPiece.new(%{})
-      assert msg =~ "role"
-      assert msg =~ "content"
+      assert ContentPiece.new(%{}) ==
+               {:error, "missing required fields: [:role, :content, :priority, :sequence]"}
     end
 
     test "error on invalid role" do
@@ -110,7 +106,13 @@ defmodule Winnow.ContentPieceTest do
           condition: quote(do: fn _x -> true end),
           cacheable: "yes",
           name: "response",
-          sequence: 1.5
+          sequence: 1.5,
+          priority: 1.5,
+          priority: "high",
+          content: 123,
+          content: ["hello"],
+          overflow: :wrap,
+          type: :video
         ] do
       test "rejects #{field}: #{Macro.to_string(bad)}" do
         bad = unquote(bad)
@@ -130,7 +132,7 @@ defmodule Winnow.ContentPieceTest do
     end
 
     test ":tool_def pieces can't truncate or have non-empty fallbacks" do
-      tool = Map.put(@valid_attrs, :type, :tool_def)
+      tool = Map.merge(@valid_attrs, %{type: :tool_def, metadata: %{name: "t"}})
 
       assert {:error, msg} = ContentPiece.new(Map.put(tool, :overflow, :truncate_end))
       assert msg =~ "can't be truncated"
@@ -139,6 +141,9 @@ defmodule Winnow.ContentPieceTest do
       assert msg =~ "only \"\" (omit)"
 
       assert {:ok, _} = ContentPiece.new(Map.put(tool, :fallbacks, [""]))
+
+      assert {:error, msg} = ContentPiece.new(Map.delete(tool, :metadata))
+      assert msg =~ "missing metadata"
     end
 
     test "unknown fields return an error instead of raising" do
@@ -157,14 +162,14 @@ defmodule Winnow.ContentPieceTest do
           name: :intro
         })
 
-      assert {:ok, _piece} = ContentPiece.new(attrs)
+      assert {:ok, piece} = ContentPiece.new(attrs)
+      assert Map.take(piece, Map.keys(attrs)) == attrs
     end
   end
 
   describe "new!/1" do
     test "returns piece on valid input" do
-      piece = ContentPiece.new!(role: :user, content: "Hi", priority: 500, sequence: 1)
-      assert piece.role == :user
+      assert ContentPiece.new!(@valid_attrs) == elem(ContentPiece.new(@valid_attrs), 1)
     end
 
     test "raises ArgumentError on invalid input" do
