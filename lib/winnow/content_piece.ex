@@ -86,6 +86,7 @@ defmodule Winnow.ContentPiece do
     with :ok <- validate_required(attrs),
          :ok <- validate_role(attrs),
          :ok <- validate_priority(attrs),
+         :ok <- validate_sequence(attrs),
          :ok <- validate_content(attrs),
          :ok <- validate_overflow(attrs),
          :ok <- validate_type(attrs),
@@ -134,6 +135,11 @@ defmodule Winnow.ContentPiece do
 
   defp validate_priority(%{priority: p}),
     do: {:error, "invalid priority: #{inspect(p)}, must be integer or :infinity"}
+
+  defp validate_sequence(%{sequence: seq}) when is_integer(seq), do: :ok
+
+  defp validate_sequence(%{sequence: seq}),
+    do: {:error, "invalid sequence: #{inspect(seq)}, must be an integer"}
 
   defp validate_content(%{content: c}) when is_binary(c), do: :ok
 

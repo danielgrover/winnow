@@ -9,21 +9,25 @@ defmodule Winnow.Renderer do
   2. Compute token counts for all pieces
   3. Resolve sections within their own sub-budgets
   4. Binary search for the lowest threshold where the pieces at or above it
-     fit the budget in their cheapest form (smallest fallback, or truncated
-     down to message overhead)
+     fit the budget in their cheapest form (smallest fallback, an empty
+     "omit" fallback, or the smallest non-empty truncation)
   5. Greedy pass in priority order: each piece takes its primary, a
      fallback, or a truncation — whatever fits after setting aside the
      minimum cost of every lower-priority piece still pending
   6. Sort by sequence, build messages, populate RenderResult
 
   Because of step 5's reservation, every piece above the threshold is
-  included — except a truncatable piece left with no room for any content,
-  which is reported as dropped. `Winnow.OversizedContentError` can only
-  occur when `:infinity`-priority pieces alone exceed the budget.
+  included with real content, except one whose cheapest option is an empty
+  (`""`, "omit") fallback, which is reported as dropped. A truncatable
+  piece's cheapest form is its smallest non-empty truncation.
+  `Winnow.OversizedContentError` can only occur when `:infinity`-priority
+  pieces alone exceed the budget.
   """
 
   alias Winnow.ContentPiece
   alias Winnow.RenderResult
+
+  @truncation_marker " [...] "
 
   @doc """
   Renders the accumulated prompt pieces within the token budget.
@@ -153,29 +157,35 @@ defmodule Winnow.Renderer do
     end)
   end
 
+  # Cheapest form a piece can take: its primary, any fallback, or (if
+  # truncatable) the smallest truncation that still carries content.
   defp min_token_cost(piece, tokenizer) do
-    # Truncatable pieces can fit in any remaining space (down to just overhead)
-    case piece.overflow do
-      overflow when overflow in [:truncate_end, :truncate_middle] ->
-        min(piece.token_count, tokenizer.message_overhead())
+    fallback_costs = Enum.map(piece.fallbacks, &fallback_cost(&1, tokenizer))
 
-      :error ->
-        min_token_cost_with_fallbacks(piece, tokenizer)
+    truncation_costs =
+      case piece.overflow do
+        :error -> []
+        mode -> [min_truncation_cost(piece.content, truncate_mode(mode), tokenizer)]
+      end
+
+    Enum.min([piece.token_count | fallback_costs ++ truncation_costs])
+  end
+
+  # An empty fallback means "omit", which costs nothing.
+  defp fallback_cost("", _tokenizer), do: 0
+
+  defp fallback_cost(fallback, tokenizer),
+    do: tokenizer.count_tokens(fallback) + tokenizer.message_overhead()
+
+  defp min_truncation_cost(content, mode, tokenizer) do
+    case minimal_truncation(content, mode) do
+      "" -> 0
+      minimal -> tokenizer.count_tokens(minimal) + tokenizer.message_overhead()
     end
   end
 
-  defp min_token_cost_with_fallbacks(%{fallbacks: []} = piece, _tokenizer) do
-    piece.token_count
-  end
-
-  defp min_token_cost_with_fallbacks(piece, tokenizer) do
-    fallback_costs =
-      Enum.map(piece.fallbacks, fn fb ->
-        tokenizer.count_tokens(fb) + tokenizer.message_overhead()
-      end)
-
-    Enum.min([piece.token_count | fallback_costs])
-  end
+  defp truncate_mode(:truncate_end), do: :end
+  defp truncate_mode(:truncate_middle), do: :middle
 
   defp split_at_threshold(pieces, threshold) do
     Enum.split_with(pieces, &priority_gte?(&1.priority, threshold))
@@ -289,7 +299,7 @@ defmodule Winnow.Renderer do
       piece.fallbacks
       |> Enum.with_index()
       |> Enum.find_value(fn {fallback_content, index} ->
-        tokens = tokenizer.count_tokens(fallback_content) + tokenizer.message_overhead()
+        tokens = fallback_cost(fallback_content, tokenizer)
 
         if tokens <= available do
           {fallback_content, tokens, index}
@@ -320,9 +330,7 @@ defmodule Winnow.Renderer do
       # Can't even fit message overhead — drop the piece
       :dropped
     else
-      truncate_mode = if piece.overflow == :truncate_end, do: :end, else: :middle
-
-      case truncate_to_fit(piece, available, truncate_mode, tokenizer) do
+      case truncate_to_fit(piece, available, truncate_mode(piece.overflow), tokenizer) do
         # No room for any content — report as dropped rather than as an
         # "included" piece that produces no message but still costs overhead.
         %{content: ""} -> :dropped
@@ -333,33 +341,68 @@ defmodule Winnow.Renderer do
 
   defp truncate_to_fit(piece, remaining, mode, tokenizer) do
     overhead = tokenizer.message_overhead()
-    available_tokens = remaining - overhead
-    # Start with optimistic byte estimate (4 bytes/token, exact for Approximate)
-    max_bytes = available_tokens * 4
-
-    content = fit_content(piece.content, max_bytes, available_tokens, mode, tokenizer)
-    token_count = tokenizer.count_tokens(content) + overhead
-    %{piece | content: content, token_count: token_count}
+    content = fit_content(piece.content, remaining - overhead, mode, tokenizer)
+    %{piece | content: content, token_count: tokenizer.count_tokens(content) + overhead}
   end
 
-  # Truncate content to fit within available_tokens. If the initial byte
-  # estimate overshoots (tokenizer has fewer bytes per token than 4),
-  # iteratively shrink using the actual ratio from the tokenizer.
-  defp fit_content(_original, max_bytes, _available_tokens, _mode, _tokenizer)
-       when max_bytes <= 0 do
-    ""
+  # Largest truncation whose token count fits in available_tokens. Gallops
+  # out from a ~4 bytes/token guess, then binary searches the byte budget,
+  # so it holds for any tokenizer's ratio (the guess only affects speed).
+  # If the search finds nothing (a non-monotonic tokenizer), use the minimal
+  # truncation when it fits — min_token_cost reserved exactly that much.
+  defp fit_content(original, available_tokens, mode, tokenizer) do
+    fits? = &(tokenizer.count_tokens(&1) <= available_tokens)
+    size = byte_size(original)
+    guess = (available_tokens * 4) |> max(1) |> min(size)
+    {lo, hi} = bracket(original, mode, fits?, 0, guess, size)
+
+    case search_bytes(original, lo, hi, mode, fits?) do
+      "" ->
+        minimal = minimal_truncation(original, mode)
+        if fits?.(minimal), do: minimal, else: ""
+
+      content ->
+        content
+    end
   end
 
-  defp fit_content(original, max_bytes, available_tokens, mode, tokenizer) do
-    content = truncate_content(original, max_bytes, mode)
-    tokens = tokenizer.count_tokens(content)
+  # Doubles `probe` until it stops fitting (or reaches the full size).
+  # Returns {lo, hi} where truncating to `lo` bytes fits.
+  defp bracket(original, mode, fits?, lo, probe, size) do
+    cond do
+      not fits?.(truncate_content(original, probe, mode)) -> {lo, probe - 1}
+      probe >= size -> {probe, probe}
+      true -> bracket(original, mode, fits?, probe, min(probe * 2, size), size)
+    end
+  end
 
-    if tokens <= available_tokens or byte_size(content) == 0 do
-      content
+  # Invariant: truncating to `lo` bytes fits ("" always does).
+  defp search_bytes(original, lo, hi, mode, _fits?) when lo >= hi do
+    truncate_content(original, lo, mode)
+  end
+
+  defp search_bytes(original, lo, hi, mode, fits?) do
+    mid = div(lo + hi + 1, 2)
+
+    if fits?.(truncate_content(original, mid, mode)) do
+      search_bytes(original, mid, hi, mode, fits?)
     else
-      # Over-estimated bytes. Shrink proportionally and ensure progress.
-      new_max = min(div(max_bytes * available_tokens, tokens), byte_size(content) - 1)
-      fit_content(original, max(new_max, 0), available_tokens, mode, tokenizer)
+      search_bytes(original, lo, mid - 1, mode, fits?)
+    end
+  end
+
+  # Smallest truncation that still carries content.
+  defp minimal_truncation(original, :end) do
+    case String.next_grapheme(original) do
+      {first, _rest} -> first
+      nil -> ""
+    end
+  end
+
+  defp minimal_truncation(original, :middle) do
+    case String.next_grapheme(original) do
+      {first, rest} when rest != "" -> first <> @truncation_marker <> last_grapheme(original)
+      _ -> original
     end
   end
 
@@ -371,60 +414,101 @@ defmodule Winnow.Renderer do
     if byte_size(original) <= max_bytes do
       original
     else
-      marker = " [...] "
-      marker_bytes = byte_size(marker)
-      usable = max(max_bytes - marker_bytes, 0)
+      usable = max(max_bytes - byte_size(@truncation_marker), 0)
       half = div(usable, 2)
       prefix = truncate_bytes(original, half)
       suffix = truncate_bytes_from_end(original, half)
 
       # A bare marker carries no content; treat it as nothing fitting.
-      if prefix == "" and suffix == "", do: "", else: prefix <> marker <> suffix
+      if prefix == "" and suffix == "",
+        do: "",
+        else: prefix <> @truncation_marker <> suffix
     end
   end
 
-  # Truncate string to at most max_bytes, respecting UTF-8 boundaries.
-  # Tracks byte offset and uses binary_part/3 for O(n) performance.
+  # First max_bytes of a string, cut at a grapheme boundary.
   defp truncate_bytes(string, max_bytes) do
-    used = truncate_bytes_used(string, max_bytes, 0)
-    binary_part(string, 0, used)
+    binary_part(string, 0, boundary_at_or_before(string, max_bytes))
   end
 
-  defp truncate_bytes_used(<<>>, _remaining, used), do: used
-
-  defp truncate_bytes_used(string, remaining, used) do
-    case String.next_grapheme(string) do
-      nil ->
-        used
-
-      {grapheme, rest} ->
-        grapheme_bytes = byte_size(grapheme)
-
-        if grapheme_bytes <= remaining do
-          truncate_bytes_used(rest, remaining - grapheme_bytes, used + grapheme_bytes)
-        else
-          used
-        end
-    end
-  end
-
-  # Take up to max_bytes from the end of a string, at UTF-8 boundaries
+  # Last max_bytes of a string, cut at a grapheme boundary.
   defp truncate_bytes_from_end(string, max_bytes) do
-    graphemes = String.graphemes(string)
-
-    graphemes
-    |> Enum.reverse()
-    |> Enum.reduce_while({<<>>, 0}, fn grapheme, {acc, used} ->
-      bytes = byte_size(grapheme)
-
-      if used + bytes <= max_bytes do
-        {:cont, {grapheme <> acc, used + bytes}}
-      else
-        {:halt, {acc, used}}
-      end
-    end)
-    |> elem(0)
+    size = byte_size(string)
+    start = boundary_at_or_after(string, max(size - max_bytes, 0))
+    binary_part(string, start, size - start)
   end
+
+  defp last_grapheme(string) do
+    size = byte_size(string)
+    start = boundary_at_or_before(string, size - 1)
+    binary_part(string, start, size - start)
+  end
+
+  # Grapheme boundaries are found by segmenting only a small window around
+  # the offset, so each cut is O(1) in the string length — the truncation
+  # search makes many cuts into potentially large content. If no reliable
+  # boundary is in the window (a cluster longer than the context), fall
+  # back to the nearest codepoint boundary, which is still valid UTF-8.
+  @grapheme_context_bytes 64
+
+  defp boundary_at_or_before(string, offset) when offset >= byte_size(string),
+    do: byte_size(string)
+
+  defp boundary_at_or_before(_string, offset) when offset <= 0, do: 0
+
+  defp boundary_at_or_before(string, offset) do
+    string
+    |> boundaries_near(offset)
+    |> Enum.filter(&(&1 <= offset))
+    |> Enum.max(fn -> codepoint_start_before(string, offset) end)
+  end
+
+  defp boundary_at_or_after(string, offset) when offset >= byte_size(string),
+    do: byte_size(string)
+
+  defp boundary_at_or_after(_string, offset) when offset <= 0, do: 0
+
+  defp boundary_at_or_after(string, offset) do
+    string
+    |> boundaries_near(offset)
+    |> Enum.filter(&(&1 >= offset))
+    |> Enum.min(fn -> codepoint_start_after(string, offset) end)
+  end
+
+  # Grapheme start offsets within ±context of offset. The window's first
+  # grapheme may begin mid-cluster, so its start only counts at offset 0;
+  # the string's end is a boundary when the window reaches it.
+  defp boundaries_near(string, offset) do
+    size = byte_size(string)
+    start = codepoint_start_after(string, max(offset - @grapheme_context_bytes, 0))
+    stop = codepoint_start_after(string, min(offset + @grapheme_context_bytes, size))
+
+    starts =
+      string
+      |> binary_part(start, stop - start)
+      |> String.graphemes()
+      |> Enum.scan(start, &(byte_size(&1) + &2))
+      |> then(&[start | &1])
+      |> Enum.drop(-1)
+
+    starts = if start == 0, do: starts, else: Enum.drop(starts, 1)
+    if stop == size, do: starts ++ [size], else: starts
+  end
+
+  defp codepoint_start_after(string, offset) do
+    if offset < byte_size(string) and continuation_byte?(string, offset),
+      do: codepoint_start_after(string, offset + 1),
+      else: offset
+  end
+
+  defp codepoint_start_before(string, offset) do
+    if offset > 0 and continuation_byte?(string, offset),
+      do: codepoint_start_before(string, offset - 1),
+      else: offset
+  end
+
+  defp continuation_byte?(string, offset),
+    do: Bitwise.band(:binary.at(string, offset), 0b1100_0000) == 0b1000_0000
 
   # Empty content produces no message, so it costs nothing unless the caller
   # set token_count explicitly (as reservations do).

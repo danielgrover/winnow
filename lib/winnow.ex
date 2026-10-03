@@ -268,9 +268,12 @@ defmodule Winnow do
       nil ->
         {winnow.next_sequence, %{winnow | next_sequence: winnow.next_sequence + 1}}
 
-      explicit ->
+      explicit when is_integer(explicit) ->
         next = max(winnow.next_sequence, explicit + 1)
         {explicit, %{winnow | next_sequence: next}}
+
+      invalid ->
+        raise ArgumentError, "invalid sequence: #{inspect(invalid)}, must be an integer"
     end
   end
 

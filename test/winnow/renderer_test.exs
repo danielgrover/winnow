@@ -286,15 +286,57 @@ defmodule Winnow.RendererTest do
     end
   end
 
+  describe "property-based — truncation respects grapheme clusters" do
+    @clusters ["a", "é", "e\u0301", "👋🏽", "👨‍👩‍👧‍👦", "🇯🇵", "中", " ", "\r\n"]
+
+    property "truncated content is made of whole graphemes from the original" do
+      check all(
+              parts <- list_of(member_of(@clusters), min_length: 2, max_length: 300),
+              budget <- integer(3..200),
+              mode <- member_of([:truncate_end, :truncate_middle])
+            ) do
+        original = Enum.join(parts)
+        graphemes = String.graphemes(original)
+
+        result =
+          Winnow.new(budget: budget, tokenizer: __MODULE__.ByteTokenizer)
+          |> Winnow.add(:user, priority: 1, content: original, overflow: mode)
+          |> Winnow.render()
+
+        assert result.total_tokens <= budget
+
+        for %{content: content} <- result.messages, content != original do
+          case String.split(content, " [...] ", parts: 2) do
+            [prefix, suffix] when mode == :truncate_middle ->
+              p = String.graphemes(prefix)
+              q = String.graphemes(suffix)
+              assert p == Enum.take(graphemes, length(p))
+              assert q == Enum.take(graphemes, -length(q))
+
+            [prefix] ->
+              p = String.graphemes(prefix)
+              assert p == Enum.take(graphemes, length(p))
+          end
+        end
+      end
+    end
+  end
+
   describe "property-based — mixed overflow modes" do
     property "never raises and keeps every piece above threshold when reservations fit" do
       check all(
               budget <- integer(20..1000),
               reserve <- integer(0..10),
+              tokenizer <-
+                member_of([
+                  Winnow.Tokenizer.Approximate,
+                  __MODULE__.ByteTokenizer,
+                  __MODULE__.LowOverheadTokenizer
+                ]),
               pieces <- list_of(mixed_piece_generator(), min_length: 0, max_length: 20)
             ) do
         w =
-          Enum.reduce(pieces, Winnow.new(budget: budget), fn opts, acc ->
+          Enum.reduce(pieces, Winnow.new(budget: budget, tokenizer: tokenizer), fn opts, acc ->
             Winnow.add(acc, :user, opts)
           end)
           |> Winnow.reserve(:response, tokens: reserve)
@@ -304,12 +346,11 @@ defmodule Winnow.RendererTest do
         assert result.total_tokens <= budget
         assert Enum.any?(result.included, &(&1.name == :response))
 
-        # Only pieces below the threshold, truncatable pieces left with no
-        # room for content, or pieces resolved to an empty ("omit") fallback
-        # are dropped.
+        # Only pieces below the threshold, or pieces resolved to an empty
+        # ("omit") fallback, are dropped. Truncatable pieces above the
+        # threshold always keep real content.
         for piece <- result.dropped do
-          assert piece.priority < result.threshold or piece.overflow != :error or
-                   "" in piece.fallbacks
+          assert piece.priority < result.threshold or "" in piece.fallbacks
         end
 
         # Nothing "included" is invisible: every included piece that started
@@ -873,9 +914,9 @@ defmodule Winnow.RendererTest do
 
       assert result.total_tokens <= 12
       [piece] = result.included
-      # With overhead=2: available_tokens=10, max_bytes=40
-      # Truncated content should be 40 bytes
-      assert byte_size(piece.content) == 40
+      # With overhead=2: 10 tokens for content. div(byte_size, 4) <= 10 allows
+      # up to 43 bytes; hardcoded overhead 4 would allow at most 35.
+      assert byte_size(piece.content) == 43
       assert piece.token_count == 12
     end
 
@@ -1069,10 +1110,26 @@ defmodule Winnow.RendererTest do
   end
 
   describe "render/1 — truncation edge cases" do
-    test "truncate with remaining = overhead exactly — dropped, not included empty" do
-      # Budget = 4 (just overhead for approximate tokenizer).
-      # available_tokens = 4 - 4 = 0, so no content fits. The piece is reported
-      # as dropped rather than "included" with empty content and phantom tokens.
+    test "truncate_middle on large multi-byte content stays valid UTF-8 and in budget" do
+      content = String.duplicate("héllo wörld 👋🏽 ", 20_000)
+
+      result =
+        Winnow.new(budget: 200)
+        |> Winnow.add(:user, priority: 1, content: content, overflow: :truncate_middle)
+        |> Winnow.render()
+
+      assert [%{content: truncated}] = result.messages
+      assert result.total_tokens <= 200
+      assert String.valid?(truncated)
+      assert truncated =~ " [...] "
+      assert String.starts_with?(truncated, "héllo")
+      # Suffix ends on a whole grapheme cluster (skin-tone emoji kept intact)
+      assert String.ends_with?(truncated, "👋🏽 ")
+    end
+
+    test "truncate with remaining = overhead exactly — keeps what costs zero tokens" do
+      # Budget = 4 (just overhead). Approximate counts 1-3 bytes as 0 tokens,
+      # so the smallest truncation fits and the piece keeps real content.
       result =
         Winnow.new(budget: 4)
         |> Winnow.add(:user,
@@ -1083,8 +1140,25 @@ defmodule Winnow.RendererTest do
         )
         |> Winnow.render()
 
+      assert result.total_tokens == 4
+      assert [%{content: "xxx"}] = result.messages
+      assert [%{metadata: {:story, 41}}] = result.included
+    end
+
+    test "truncatable piece with no room for content is dropped, not included empty" do
+      # 1 token per byte, overhead 2: the smallest truncation ("x") costs 3.
+      # At budget 2 only the overhead fits, so there's no room for content.
+      result =
+        Winnow.new(budget: 2, tokenizer: __MODULE__.ByteTokenizer)
+        |> Winnow.add(:user,
+          priority: 1000,
+          content: String.duplicate("x", 100),
+          overflow: :truncate_end,
+          metadata: {:story, 41}
+        )
+        |> Winnow.render()
+
       assert result.total_tokens == 0
-      assert result.messages == []
       assert result.included == []
       assert [%{metadata: {:story, 41}}] = result.dropped
     end
@@ -1260,6 +1334,20 @@ defmodule Winnow.RendererTest do
   end
 
   describe "render/1 — fallback edge cases" do
+    test "empty fallback costs nothing — no priority inversion" do
+      # The optional piece can always be omitted, so the high-priority piece
+      # keeps its primary instead of downgrading to make room for nothing.
+      result =
+        Winnow.new(budget: 24)
+        |> Winnow.add(:system, priority: 100, content: "big", token_count: 22, fallbacks: ["sm"])
+        |> Winnow.add(:user, priority: 1, content: "opt", token_count: 50, fallbacks: [""])
+        |> Winnow.render()
+
+      assert Enum.map(result.messages, & &1.content) == ["big"]
+      assert result.fallbacks_used == []
+      assert [%{content: "opt"}] = result.dropped
+    end
+
     test "empty-string fallback means omit — piece reported as dropped" do
       result =
         Winnow.new(budget: 14)
@@ -1474,13 +1562,17 @@ defmodule Winnow.RendererTest do
   defp mixed_piece_generator do
     gen all(
           priority <- integer(1..100),
-          content_size <- integer(0..400),
+          content <-
+            one_of([
+              map(integer(0..400), &String.duplicate("x", &1)),
+              string(:printable, max_length: 300)
+            ]),
           overflow <- member_of([:error, :truncate_end, :truncate_middle]),
           fallbacks <- list_of(string(:alphanumeric, max_length: 40), max_length: 2)
         ) do
       [
         priority: priority,
-        content: String.duplicate("x", content_size),
+        content: content,
         overflow: overflow,
         fallbacks: fallbacks
       ]

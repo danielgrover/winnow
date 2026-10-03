@@ -557,6 +557,12 @@ defmodule WinnowTest do
       end
     end
 
+    test "add/3 rejects non-integer sequence" do
+      assert_raise ArgumentError, ~r/invalid sequence/, fn ->
+        Winnow.new(budget: 100) |> Winnow.add(:user, priority: 1, content: "x", sequence: "a")
+      end
+    end
+
     test "add/3 rejects non-string fallbacks" do
       assert_raise ArgumentError, ~r/invalid fallbacks/, fn ->
         Winnow.new(budget: 100) |> Winnow.add(:user, priority: 1, content: "x", fallbacks: [1])

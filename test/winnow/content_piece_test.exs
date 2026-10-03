@@ -109,7 +109,8 @@ defmodule Winnow.ContentPieceTest do
           condition: true,
           condition: quote(do: fn _x -> true end),
           cacheable: "yes",
-          name: "response"
+          name: "response",
+          sequence: 1.5
         ] do
       test "rejects #{field}: #{Macro.to_string(bad)}" do
         bad = unquote(bad)
