@@ -41,7 +41,7 @@ defmodule Winnow.ContentPieceTest do
           fallbacks: ["short version"],
           section: :memory,
           cacheable: true,
-          type: :tool_def,
+          type: :file,
           overflow: :truncate_end
         })
 
@@ -50,7 +50,7 @@ defmodule Winnow.ContentPieceTest do
       assert piece.fallbacks == ["short version"]
       assert piece.section == :memory
       assert piece.cacheable == true
-      assert piece.type == :tool_def
+      assert piece.type == :file
       assert piece.overflow == :truncate_end
     end
 
@@ -119,6 +119,26 @@ defmodule Winnow.ContentPieceTest do
         assert {:error, msg} = ContentPiece.new(Map.put(@valid_attrs, unquote(field), bad))
         assert msg =~ expected
       end
+    end
+
+    test "rejects content and fallbacks that aren't valid UTF-8" do
+      assert {:error, msg} = ContentPiece.new(%{@valid_attrs | content: <<0xFF, 0xFE>>})
+      assert msg =~ "UTF-8"
+
+      assert {:error, msg} = ContentPiece.new(Map.put(@valid_attrs, :fallbacks, [<<0x80>>]))
+      assert msg =~ "UTF-8"
+    end
+
+    test ":tool_def pieces can't truncate or have non-empty fallbacks" do
+      tool = Map.put(@valid_attrs, :type, :tool_def)
+
+      assert {:error, msg} = ContentPiece.new(Map.put(tool, :overflow, :truncate_end))
+      assert msg =~ "can't be truncated"
+
+      assert {:error, msg} = ContentPiece.new(Map.put(tool, :fallbacks, ["short"]))
+      assert msg =~ "only \"\" (omit)"
+
+      assert {:ok, _} = ContentPiece.new(Map.put(tool, :fallbacks, [""]))
     end
 
     test "accepts valid optional fields" do

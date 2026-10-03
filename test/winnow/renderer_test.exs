@@ -287,7 +287,21 @@ defmodule Winnow.RendererTest do
   end
 
   describe "property-based — truncation respects grapheme clusters" do
-    @clusters ["a", "é", "e\u0301", "👋🏽", "👨‍👩‍👧‍👦", "🇯🇵", "中", " ", "\r\n"]
+    # Includes a 12-flag run: longer than the boundary search's window, so a
+    # window can start mid-flag.
+    @clusters [
+      "a",
+      "é",
+      "e\u0301",
+      "👋🏽",
+      "👨‍👩‍👧‍👦",
+      "🇯🇵",
+      "中",
+      " ",
+      "\r\n",
+      String.duplicate("🇺🇸", 12),
+      String.duplicate("e\u0301\u0302", 30)
+    ]
 
     property "truncated content is made of whole graphemes from the original" do
       check all(
@@ -1110,6 +1124,41 @@ defmodule Winnow.RendererTest do
   end
 
   describe "render/1 — truncation edge cases" do
+    test "flag emoji are never split, even in runs longer than the boundary window" do
+      flags = String.duplicate("🇺🇸", 40)
+
+      for budget <- [20, 30, 40], mode <- [:truncate_end, :truncate_middle] do
+        result =
+          Winnow.new(budget: budget)
+          |> Winnow.add(:user, priority: 1, content: flags, overflow: mode)
+          |> Winnow.render()
+
+        [%{content: content}] = result.messages
+        kept = String.replace(content, " [...] ", "")
+        assert rem(byte_size(kept), 8) == 0, "split flag at budget #{budget}, #{mode}"
+        assert Enum.all?(String.graphemes(kept), &(&1 == "🇺🇸"))
+      end
+    end
+
+    test "explicit token_count that disagrees with the content isn't 'truncated' into a lie" do
+      # The tokenizer thinks "<image ref>" is tiny; the caller says 1000.
+      # Truncation can't shrink what's already short, so the piece is dropped
+      # instead of being reported at the tokenizer's 6 tokens.
+      result =
+        Winnow.new(budget: 50)
+        |> Winnow.add(:user,
+          priority: 1,
+          content: "<image ref>",
+          token_count: 1000,
+          overflow: :truncate_end
+        )
+        |> Winnow.render()
+
+      assert result.included == []
+      assert result.total_tokens == 0
+      assert [%{token_count: 1000}] = result.dropped
+    end
+
     test "truncate_middle on large multi-byte content stays valid UTF-8 and in budget" do
       content = String.duplicate("héllo wörld 👋🏽 ", 20_000)
 
@@ -1259,6 +1308,45 @@ defmodule Winnow.RendererTest do
   end
 
   describe "render/1 — section edge cases" do
+    test "identical pieces each keep their own fallback bookkeeping" do
+      piece_opts = [
+        priority: :infinity,
+        content: String.duplicate("x", 400),
+        fallbacks: ["shrt"],
+        overflow: :truncate_end,
+        sequence: 5,
+        section: :s
+      ]
+
+      result =
+        Winnow.new(budget: 6)
+        |> Winnow.section(:s, max_tokens: 100)
+        |> Winnow.add(:user, piece_opts)
+        |> Winnow.add(:user, piece_opts)
+        |> Winnow.render()
+
+      assert [%{content: "shrt"}] = result.included
+      assert [_] = result.dropped
+      assert [{%{content: "xxxx" <> _}, 0}] = result.fallbacks_used
+    end
+
+    test ":infinity piece over its section cap raises naming the section" do
+      error =
+        assert_raise Winnow.OversizedContentError, fn ->
+          Winnow.new(budget: 10_000)
+          |> Winnow.section(:memory, max_tokens: 5)
+          |> Winnow.add(:user,
+            priority: :infinity,
+            content: String.duplicate("x", 100),
+            section: :memory
+          )
+          |> Winnow.render()
+        end
+
+      assert error.section == :memory
+      assert Exception.message(error) =~ "in section :memory"
+    end
+
     test "section fallback not reported when main pass drops the piece" do
       result =
         Winnow.new(budget: 10)
@@ -1274,7 +1362,9 @@ defmodule Winnow.RendererTest do
         |> Winnow.render()
 
       assert [%{content: "sys"}] = result.messages
-      assert [%{content: "tiny"}] = result.dropped
+      # Dropped pieces are reported in their original form, not the section's
+      # resolved fallback
+      assert [%{content: "big", fallbacks: ["tiny"]}] = result.dropped
       assert result.fallbacks_used == []
     end
 

@@ -37,35 +37,31 @@ defmodule Winnow.Renderer do
     tokenizer = winnow.tokenizer
     budget = winnow.budget
 
-    # Step 1: Evaluate conditions — exclude pieces where condition returns false
+    # Step 1: Evaluate conditions — exclude pieces where condition is falsy
     {pieces, condition_excluded} = evaluate_conditions(winnow.pieces)
 
-    # Step 2: Compute token costs for each piece (primary and fallbacks)
-    costed_pieces = compute_token_costs(pieces, tokenizer)
+    # Step 2: Compute token costs. Each piece then travels as an entry
+    # {original, current, fallback_index} so results can report the original
+    # of anything dropped, and which fallback a kept piece ended up using,
+    # without comparing structs.
+    entries =
+      pieces
+      |> compute_token_costs(tokenizer)
+      |> Enum.map(&{&1, &1, nil})
 
     # Step 3: Render sections independently within their sub-budgets
-    {main_pieces, section_dropped, section_fallbacks} =
-      render_sections(costed_pieces, winnow.sections, tokenizer)
+    {main_entries, section_dropped} = render_sections(entries, winnow.sections, tokenizer)
 
-    # Step 4: Find the threshold using minimum possible cost
-    threshold = find_threshold(main_pieces, budget, tokenizer)
+    # Steps 4-5: Threshold over cheapest forms, then greedy fit
+    {threshold, included_entries, main_dropped} =
+      fit_entries(main_entries, budget, tokenizer, nil)
 
-    # Split into included/dropped by threshold
-    {above_threshold, dropped} = split_at_threshold(main_pieces, threshold)
+    all_dropped = Enum.map(main_dropped ++ section_dropped, &original/1)
 
-    # Step 5: Resolve fallbacks and overflow for pieces above threshold
-    {final_included, extra_dropped, fallbacks_used} =
-      resolve_fit(above_threshold, budget, tokenizer)
-
-    main_dropped = dropped ++ extra_dropped
-    all_dropped = main_dropped ++ section_dropped
-
-    # A section piece that resolved to a fallback may still be dropped by
-    # the main pass; only report fallbacks whose result was kept.
     all_fallbacks =
-      (section_fallbacks ++ fallbacks_used)
-      |> Enum.reject(fn {_original, _index, resolved} -> resolved in main_dropped end)
-      |> Enum.map(fn {original, index, _resolved} -> {original, index} end)
+      for {original, _current, index} <- included_entries, index != nil, do: {original, index}
+
+    final_included = Enum.map(included_entries, &current/1)
 
     # Sort included by sequence for output ordering
     final_included = Enum.sort_by(final_included, & &1.sequence)
@@ -187,10 +183,6 @@ defmodule Winnow.Renderer do
   defp truncate_mode(:truncate_end), do: :end
   defp truncate_mode(:truncate_middle), do: :middle
 
-  defp split_at_threshold(pieces, threshold) do
-    Enum.split_with(pieces, &priority_gte?(&1.priority, threshold))
-  end
-
   # Evaluate conditions: partition into kept pieces and condition-excluded pieces
   defp evaluate_conditions(pieces) do
     Enum.split_with(pieces, fn piece ->
@@ -198,103 +190,96 @@ defmodule Winnow.Renderer do
     end)
   end
 
-  # Render sections independently with their own sub-budgets.
-  # Returns {main_pieces, section_dropped, section_fallbacks} where main_pieces
-  # contains non-sectioned pieces plus each section's surviving pieces, already
-  # resolved (fallback/truncation applied). Those pieces keep their priorities
-  # and compete individually in the main pass, which may drop or truncate them
-  # further.
-  defp render_sections(pieces, sections, _tokenizer) when map_size(sections) == 0 do
-    {pieces, [], []}
-  end
+  defp original({original, _current, _index}), do: original
+  defp current({_original, current, _index}), do: current
 
-  defp render_sections(pieces, sections, tokenizer) do
-    {section_pieces, main_pieces} = Enum.split_with(pieces, &(not is_nil(&1.section)))
+  # Render sections independently with their own sub-budgets. Returns
+  # {main_entries, section_dropped}: main_entries holds unsectioned entries
+  # plus each section's survivors, already resolved (fallback/truncation
+  # applied). Survivors keep their priorities and compete individually in
+  # the main pass, which may drop or truncate them further. Pieces naming
+  # an undefined section are treated as unsectioned.
+  defp render_sections(entries, sections, tokenizer) do
+    {sectioned, unsectioned} =
+      Enum.split_with(entries, &Map.has_key?(sections, current(&1).section))
 
-    # Group section pieces by section name
-    by_section = Enum.group_by(section_pieces, & &1.section)
+    results =
+      sectioned
+      |> Enum.group_by(&current(&1).section)
+      |> Enum.map(fn {name, section_entries} ->
+        section = Map.fetch!(sections, name)
 
-    {resolved_pieces, all_dropped, all_fallbacks} =
-      Enum.reduce(by_section, {[], [], []}, fn {name, sec_pieces}, {inc, drop, fb} ->
-        case Map.get(sections, name) do
-          nil ->
-            # No section definition — treat as main pieces
-            {sec_pieces ++ inc, drop, fb}
+        {_threshold, kept, dropped} =
+          fit_entries(section_entries, section.max_tokens, tokenizer, name)
 
-          section ->
-            # Render this section with its own sub-budget
-            {sec_included, sec_dropped, sec_fb} =
-              render_section(sec_pieces, section.max_tokens, tokenizer)
-
-            {sec_included ++ inc, sec_dropped ++ drop, sec_fb ++ fb}
-        end
+        {kept, dropped}
       end)
 
-    {main_pieces ++ resolved_pieces, all_dropped, all_fallbacks}
+    {unsectioned ++ Enum.flat_map(results, &elem(&1, 0)), Enum.flat_map(results, &elem(&1, 1))}
   end
 
-  # Render a single section: binary search + greedy fit within the section budget.
-  # Returns included pieces with token_count set to their actual cost.
-  defp render_section(pieces, max_tokens, tokenizer) do
-    threshold = find_threshold(pieces, max_tokens, tokenizer)
-    {above, dropped} = split_at_threshold(pieces, threshold)
-    {included, extra_dropped, fallbacks} = resolve_fit(above, max_tokens, tokenizer)
-    {included, dropped ++ extra_dropped, fallbacks}
+  # Binary-search the threshold over the entries' cheapest forms, drop those
+  # below it, and greedily fit the rest. `scope` is the section name (nil for
+  # the main pass), used for error context.
+  defp fit_entries(entries, budget, tokenizer, scope) do
+    threshold = entries |> Enum.map(&current/1) |> find_threshold(budget, tokenizer)
+
+    {above, below} = Enum.split_with(entries, &priority_gte?(current(&1).priority, threshold))
+    {included, dropped} = resolve_fit(above, budget, tokenizer, scope)
+    {threshold, included, below ++ dropped}
   end
 
   # Greedy post-threshold pass: resolve fallbacks and overflow.
   #
-  # Pieces are visited in priority order (highest first, ties by sequence).
-  # Each piece may only consume what's left after setting aside the minimum
-  # cost of every piece still pending. Since the threshold guarantees the
-  # sum of minimum costs fits the budget, every piece above the threshold
-  # gets at least its cheapest form, and spare budget upgrades the most
-  # important pieces first (primary over fallback, longer truncation).
-  #
-  # Fallbacks are returned as `{original, index, resolved}` triples so the
-  # caller can discard entries whose resolved piece is dropped later.
-  defp resolve_fit(pieces, budget, tokenizer) do
+  # Entries are visited in priority order (highest first, ties by sequence).
+  # Each may only consume what's left after setting aside the minimum cost
+  # of every entry still pending. Since the threshold guarantees the sum of
+  # minimum costs fits the budget, every entry above the threshold gets at
+  # least its cheapest form, and spare budget upgrades the most important
+  # pieces first (primary over fallback, longer truncation).
+  defp resolve_fit(entries, budget, tokenizer, scope) do
     costed =
-      pieces
-      |> Enum.map(&{&1, min_token_cost(&1, tokenizer)})
-      |> Enum.sort_by(fn {piece, _cost} -> fit_order_key(piece) end)
+      entries
+      |> Enum.map(&{&1, min_token_cost(current(&1), tokenizer)})
+      |> Enum.sort_by(fn {entry, _cost} -> fit_order_key(current(entry)) end)
 
-    pending = Enum.reduce(costed, 0, fn {_piece, cost}, acc -> acc + cost end)
+    pending = Enum.reduce(costed, 0, fn {_entry, cost}, acc -> acc + cost end)
 
-    {included, dropped, fallbacks_used, _remaining, _pending} =
-      Enum.reduce(costed, {[], [], [], budget, pending}, fn {piece, min_cost},
-                                                            {inc, drop, fb, remaining, pending} ->
+    {included, dropped, _remaining, _pending} =
+      Enum.reduce(costed, {[], [], budget, pending}, fn {{original, piece, fb_index} = entry,
+                                                         min_cost},
+                                                        {inc, drop, remaining, pending} ->
         pending = pending - min_cost
         available = remaining - pending
 
-        case fit_piece(piece, available, tokenizer) do
+        case fit_piece(piece, available, tokenizer, scope) do
           {:included, resolved} ->
-            {[resolved | inc], drop, fb, remaining - resolved.token_count, pending}
+            {[{original, resolved, fb_index} | inc], drop, remaining - resolved.token_count,
+             pending}
 
           {:fallback, resolved, index} ->
-            fb = [{piece, index, resolved} | fb]
-            {[resolved | inc], drop, fb, remaining - resolved.token_count, pending}
+            {[{original, resolved, index} | inc], drop, remaining - resolved.token_count, pending}
 
           :dropped ->
-            {inc, [piece | drop], fb, remaining, pending}
+            {inc, [entry | drop], remaining, pending}
         end
       end)
 
-    {Enum.reverse(included), Enum.reverse(dropped), Enum.reverse(fallbacks_used)}
+    {Enum.reverse(included), Enum.reverse(dropped)}
   end
 
   defp fit_order_key(%{priority: :infinity, sequence: seq}), do: {0, 0, seq}
   defp fit_order_key(%{priority: priority, sequence: seq}), do: {1, -priority, seq}
 
-  defp fit_piece(piece, available, tokenizer) do
+  defp fit_piece(piece, available, tokenizer, scope) do
     if piece.token_count <= available do
       {:included, piece}
     else
-      try_fallbacks(piece, available, tokenizer)
+      try_fallbacks(piece, available, tokenizer, scope)
     end
   end
 
-  defp try_fallbacks(piece, available, tokenizer) do
+  defp try_fallbacks(piece, available, tokenizer, scope) do
     result =
       piece.fallbacks
       |> Enum.with_index()
@@ -315,17 +300,21 @@ defmodule Winnow.Renderer do
         {:fallback, %{piece | content: content, token_count: tokens, fallbacks: []}, index}
 
       nil ->
-        handle_overflow(piece, available, tokenizer)
+        handle_overflow(piece, available, tokenizer, scope)
     end
   end
 
-  # Only reachable when :infinity pieces alone exceed the budget (the
-  # threshold guarantees everything else gets at least its minimum cost).
-  defp handle_overflow(%{overflow: :error} = piece, available, _tokenizer) do
-    raise Winnow.OversizedContentError, piece: piece, remaining_budget: max(available, 0)
+  # Only reachable when :infinity pieces alone exceed the budget, or their
+  # section's max_tokens (the threshold guarantees everything else gets at
+  # least its minimum cost).
+  defp handle_overflow(%{overflow: :error} = piece, available, _tokenizer, scope) do
+    raise Winnow.OversizedContentError,
+      piece: piece,
+      remaining_budget: max(available, 0),
+      section: scope
   end
 
-  defp handle_overflow(piece, available, tokenizer) do
+  defp handle_overflow(piece, available, tokenizer, _scope) do
     if available < tokenizer.message_overhead() do
       # Can't even fit message overhead — drop the piece
       :dropped
@@ -333,8 +322,16 @@ defmodule Winnow.Renderer do
       case truncate_to_fit(piece, available, truncate_mode(piece.overflow), tokenizer) do
         # No room for any content — report as dropped rather than as an
         # "included" piece that produces no message but still costs overhead.
-        %{content: ""} -> :dropped
-        truncated -> {:included, truncated}
+        %{content: ""} ->
+          :dropped
+
+        # Nothing was cut, yet the piece didn't fit: its explicit token_count
+        # disagrees with the tokenizer, so a recount can't be trusted.
+        %{content: content} when content == piece.content ->
+          :dropped
+
+        truncated ->
+          {:included, truncated}
       end
     end
   end
@@ -444,11 +441,11 @@ defmodule Winnow.Renderer do
     binary_part(string, start, size - start)
   end
 
-  # Grapheme boundaries are found by segmenting only a small window around
-  # the offset, so each cut is O(1) in the string length — the truncation
-  # search makes many cuts into potentially large content. If no reliable
-  # boundary is in the window (a cluster longer than the context), fall
-  # back to the nearest codepoint boundary, which is still valid UTF-8.
+  # Grapheme boundaries are found by segmenting only a window around the
+  # offset, so a cut doesn't re-segment the whole string — the truncation
+  # search makes many cuts into potentially large content. The window starts
+  # at a provably real boundary (see safe_boundary_at_or_before/2), which
+  # makes every grapheme start inside it exact.
   @grapheme_context_bytes 64
 
   defp boundary_at_or_before(string, offset) when offset >= byte_size(string),
@@ -458,42 +455,77 @@ defmodule Winnow.Renderer do
 
   defp boundary_at_or_before(string, offset) do
     string
-    |> boundaries_near(offset)
+    |> grapheme_starts(offset, @grapheme_context_bytes)
     |> Enum.filter(&(&1 <= offset))
-    |> Enum.max(fn -> codepoint_start_before(string, offset) end)
+    |> Enum.max()
   end
 
-  defp boundary_at_or_after(string, offset) when offset >= byte_size(string),
+  defp boundary_at_or_after(string, offset, context \\ @grapheme_context_bytes)
+
+  defp boundary_at_or_after(string, offset, _context) when offset >= byte_size(string),
     do: byte_size(string)
 
-  defp boundary_at_or_after(_string, offset) when offset <= 0, do: 0
+  defp boundary_at_or_after(_string, offset, _context) when offset <= 0, do: 0
 
-  defp boundary_at_or_after(string, offset) do
-    string
-    |> boundaries_near(offset)
-    |> Enum.filter(&(&1 >= offset))
-    |> Enum.min(fn -> codepoint_start_after(string, offset) end)
+  defp boundary_at_or_after(string, offset, context) do
+    case string |> grapheme_starts(offset, context) |> Enum.filter(&(&1 >= offset)) do
+      # The cluster containing offset runs past the window; widen it. The
+      # string's end always counts, so this terminates.
+      [] -> boundary_at_or_after(string, offset, context * 2)
+      starts -> Enum.min(starts)
+    end
   end
 
-  # Grapheme start offsets within ±context of offset. The window's first
-  # grapheme may begin mid-cluster, so its start only counts at offset 0;
-  # the string's end is a boundary when the window reaches it.
-  defp boundaries_near(string, offset) do
+  # Exact grapheme start offsets in a window around offset. The window's
+  # start is a real boundary, so it's included; its end is cut arbitrarily,
+  # so only counts when it is the string's end.
+  defp grapheme_starts(string, offset, context) do
     size = byte_size(string)
-    start = codepoint_start_after(string, max(offset - @grapheme_context_bytes, 0))
-    stop = codepoint_start_after(string, min(offset + @grapheme_context_bytes, size))
 
-    starts =
+    start =
+      safe_boundary_at_or_before(string, codepoint_start_before(string, max(offset - context, 0)))
+
+    stop = codepoint_start_after(string, min(offset + context, size))
+
+    ends =
       string
       |> binary_part(start, stop - start)
       |> String.graphemes()
       |> Enum.scan(start, &(byte_size(&1) + &2))
-      |> then(&[start | &1])
-      |> Enum.drop(-1)
 
-    starts = if start == 0, do: starts, else: Enum.drop(starts, 1)
-    if stop == size, do: starts ++ [size], else: starts
+    starts = [start | ends]
+    if stop == size, do: starts, else: Enum.drop(starts, -1)
   end
+
+  # Nearest codepoint boundary at or before p that is certainly a grapheme
+  # boundary. Pairwise segmentation (x <> y splitting) can be fooled only by
+  # rules that look further back: regional-indicator pairing (flags), emoji
+  # ZWJ sequences, and Indic conjuncts. All of those need x to be a regional
+  # indicator or to attach to what precedes it (ZWJ, combining marks), so
+  # such positions are skipped.
+  defp safe_boundary_at_or_before(_string, 0), do: 0
+
+  defp safe_boundary_at_or_before(string, p) do
+    prev = codepoint_start_before(string, p - 1)
+    x = binary_part(string, prev, p - prev)
+    y = string |> binary_part(p, min(4, byte_size(string) - p)) |> first_codepoint()
+
+    if regional_indicator?(x) or attaches?(x) or not match?([_, _], String.graphemes(x <> y)),
+      do: safe_boundary_at_or_before(string, prev),
+      else: p
+  end
+
+  defp first_codepoint(binary) do
+    case String.next_codepoint(binary) do
+      {codepoint, _rest} -> codepoint
+      nil -> ""
+    end
+  end
+
+  defp regional_indicator?(<<codepoint::utf8>>), do: codepoint in 0x1F1E6..0x1F1FF
+  defp regional_indicator?(_), do: false
+
+  defp attaches?(codepoint), do: match?([_], String.graphemes("a" <> codepoint))
 
   defp codepoint_start_after(string, offset) do
     if offset < byte_size(string) and continuation_byte?(string, offset),

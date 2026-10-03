@@ -69,7 +69,9 @@ defmodule Winnow do
   - `fallbacks` — list of fallback content strings (`""` means omit)
   - `section` — atom naming a sub-budget section
   - `cacheable` — boolean hint for cache-friendly ordering
-  - `type` — `:text`, `:image`, `:tool_def`, or `:file`
+  - `type` — `:text`, `:image`, `:tool_def`, or `:file`. `:tool_def` pieces
+    can't truncate or have non-empty fallbacks, since the full tool definition
+    (`metadata`) is sent regardless of content
   - `condition` — zero-arity function; piece excluded at render time if it returns
     a falsy value (`false` or `nil`)
   - `overflow` — `:error`, `:truncate_end`, or `:truncate_middle`
@@ -124,16 +126,18 @@ defmodule Winnow do
 
     base_opts = Keyword.drop(opts, [:items, :formatter, :priority_fn, :metadata_fn])
 
-    Enum.with_index(items)
-    |> Enum.reduce(winnow, fn {item, index}, acc ->
-      piece_opts =
-        base_opts
-        |> Keyword.put(:content, formatter.(item))
-        |> Keyword.put(:priority, priority_fn.(item, index))
-        |> put_metadata(metadata_fn, item, index)
+    {winnow, _count} =
+      Enum.reduce(items, {winnow, 0}, fn item, {acc, index} ->
+        piece_opts =
+          base_opts
+          |> Keyword.put(:content, formatter.(item))
+          |> Keyword.put(:priority, priority_fn.(item, index))
+          |> put_metadata(metadata_fn, item, index)
 
-      add(acc, role, piece_opts)
-    end)
+        {add(acc, role, piece_opts), index + 1}
+      end)
+
+    winnow
   end
 
   defp put_metadata(opts, nil, _item, _index), do: opts
@@ -205,12 +209,19 @@ defmodule Winnow do
 
   ## Options
 
-  - `max_tokens` (required) — maximum tokens for this section
+  - `max_tokens` (required) — maximum tokens for this section. This caps
+    `:infinity`-priority pieces in the section too; if they exceed it,
+    `Winnow.OversizedContentError` is raised with `section` set.
   """
   @spec section(t(), atom(), keyword()) :: t()
   def section(%__MODULE__{} = winnow, name, opts) do
     max_tokens = Keyword.fetch!(opts, :max_tokens)
     validate_non_neg_integer!(:max_tokens, max_tokens)
+
+    unless is_atom(name) and not is_nil(name) do
+      raise ArgumentError, "invalid section name: #{inspect(name)}, must be a non-nil atom"
+    end
+
     section = %Winnow.Section{name: name, max_tokens: max_tokens}
     %{winnow | sections: Map.put(winnow.sections, name, section)}
   end
@@ -220,7 +231,8 @@ defmodule Winnow do
 
   Budget and tokenizer come from the left (base) struct. The right
   struct's pieces get their sequence numbers offset to come after
-  the base's pieces. Sections are merged.
+  the base's pieces (preserving their relative order). Sections are
+  merged; when both define the same name, the right one wins.
 
   ## Example
 
@@ -234,7 +246,10 @@ defmodule Winnow do
   """
   @spec merge(t(), t()) :: t()
   def merge(%__MODULE__{} = left, %__MODULE__{} = right) do
-    offset = left.next_sequence
+    # Shift so the right side's lowest sequence (which may be explicit or
+    # negative) lands just after everything on the left.
+    right_min = right.pieces |> Enum.map(& &1.sequence) |> Enum.min(fn -> 0 end) |> min(0)
+    offset = left.next_sequence - right_min
 
     offset_pieces =
       Enum.map(right.pieces, fn piece ->

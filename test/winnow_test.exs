@@ -569,4 +569,54 @@ defmodule WinnowTest do
       end
     end
   end
+
+  describe "merge/2 sequence handling" do
+    test "right pieces with negative or explicit sequences still follow the left" do
+      left =
+        Winnow.new(budget: 100)
+        |> Winnow.add(:user, priority: 1, content: "L0")
+        |> Winnow.add(:user, priority: 1, content: "L1")
+        |> Winnow.add(:user, priority: 1, content: "L2")
+
+      right =
+        Winnow.new(budget: 100)
+        |> Winnow.add(:user, priority: 1, content: "R-first", sequence: -10)
+        |> Winnow.add(:user, priority: 1, content: "R1")
+
+      merged = Winnow.merge(left, right)
+      messages = merged |> Winnow.render() |> Map.get(:messages) |> Enum.map(& &1.content)
+
+      assert messages == ["L0", "L1", "L2", "R-first", "R1"]
+      sequences = Enum.map(merged.pieces, & &1.sequence)
+      assert sequences == Enum.uniq(sequences)
+
+      # Later adds still go after everything
+      after_add = Winnow.add(merged, :user, priority: 1, content: "next")
+      assert List.last(after_add.pieces).sequence > Enum.max(sequences)
+    end
+  end
+
+  describe "section/3 name validation" do
+    test "rejects nil and non-atom names" do
+      # apply/3 keeps the type checker from flagging these deliberately bad calls
+      for name <- [nil, "memory"] do
+        assert_raise ArgumentError, ~r/invalid section name/, fn ->
+          # credo:disable-for-next-line Credo.Check.Refactor.Apply
+          apply(Winnow, :section, [Winnow.new(budget: 100), name, [max_tokens: 10]])
+        end
+      end
+    end
+  end
+
+  describe "add_tools/3 validation" do
+    test "rejects truncation for tool definitions" do
+      assert_raise ArgumentError, ~r/can't be truncated/, fn ->
+        Winnow.new(budget: 100)
+        |> Winnow.add_tools([%{name: "search", description: "Search"}],
+          priority: 1,
+          overflow: :truncate_end
+        )
+      end
+    end
+  end
 end

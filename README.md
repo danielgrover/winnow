@@ -16,7 +16,8 @@ def deps do
     {:winnow, "~> 0.1.0"},
 
     # Optional: exact token counting for OpenAI models
-    {:tiktoken, "~> 0.4", optional: true}
+    # (enables Winnow.Tokenizer.Tiktoken)
+    {:tiktoken, "~> 0.4"}
   ]
 end
 ```
@@ -150,7 +151,7 @@ Winnow.add(:user,
 
 Pieces above the threshold always fit in at least their cheapest form, so `:error` only raises
 (`Winnow.OversizedContentError`) when `:infinity`-priority pieces — including reservations — exceed
-the budget on their own.
+the budget on their own, or exceed their section's `max_tokens`.
 
 ### Merging
 

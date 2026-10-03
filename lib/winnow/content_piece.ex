@@ -10,7 +10,7 @@ defmodule Winnow.ContentPiece do
   ## Required Fields
 
   - `role` — `:system`, `:user`, or `:assistant`
-  - `content` — the text content (string)
+  - `content` — the text content (valid UTF-8 string)
   - `priority` — integer, higher means more important
   - `sequence` — integer, determines output order
 
@@ -95,7 +95,8 @@ defmodule Winnow.ContentPiece do
          :ok <- validate_section(attrs),
          :ok <- validate_condition(attrs),
          :ok <- validate_cacheable(attrs),
-         :ok <- validate_name(attrs) do
+         :ok <- validate_name(attrs),
+         :ok <- validate_tool_def(attrs) do
       {:ok, struct!(__MODULE__, attrs)}
     end
   end
@@ -141,7 +142,9 @@ defmodule Winnow.ContentPiece do
   defp validate_sequence(%{sequence: seq}),
     do: {:error, "invalid sequence: #{inspect(seq)}, must be an integer"}
 
-  defp validate_content(%{content: c}) when is_binary(c), do: :ok
+  defp validate_content(%{content: c}) when is_binary(c) do
+    if String.valid?(c), do: :ok, else: {:error, "invalid content: not valid UTF-8"}
+  end
 
   defp validate_content(%{content: c}),
     do: {:error, "invalid content: expected string, got #{inspect(c)}"}
@@ -166,9 +169,9 @@ defmodule Winnow.ContentPiece do
   defp validate_token_count(_attrs), do: :ok
 
   defp validate_fallbacks(%{fallbacks: fallbacks}) when is_list(fallbacks) do
-    if Enum.all?(fallbacks, &is_binary/1),
+    if Enum.all?(fallbacks, &(is_binary(&1) and String.valid?(&1))),
       do: :ok,
-      else: {:error, "invalid fallbacks: #{inspect(fallbacks)}, must be a list of strings"}
+      else: {:error, "invalid fallbacks: #{inspect(fallbacks)}, must be a list of UTF-8 strings"}
   end
 
   defp validate_fallbacks(%{fallbacks: fallbacks}),
@@ -203,4 +206,21 @@ defmodule Winnow.ContentPiece do
     do: {:error, "invalid name: #{inspect(name)}, must be an atom"}
 
   defp validate_name(_attrs), do: :ok
+
+  # The full tool definition travels in metadata, so a tool piece's cost
+  # can't shrink by truncating or swapping its content.
+  defp validate_tool_def(%{type: :tool_def} = attrs) do
+    cond do
+      Map.get(attrs, :overflow, :error) != :error ->
+        {:error, "invalid overflow for :tool_def: tool definitions can't be truncated"}
+
+      Enum.any?(Map.get(attrs, :fallbacks, []), &(&1 != "")) ->
+        {:error, "invalid fallbacks for :tool_def: only \"\" (omit) is allowed"}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp validate_tool_def(_attrs), do: :ok
 end
