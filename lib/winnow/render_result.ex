@@ -14,8 +14,9 @@ defmodule Winnow.RenderResult do
     and tool definitions (so it can exceed what `messages` alone cost)
   - `budget` — the original token budget
   - `threshold` — the lowest admitted priority level. Levels are admitted
-    from highest to lowest while their pieces (those without a `""` fallback)
-    fit; omittable pieces skipped for lack of room can sit at or above it.
+    from highest to lowest while their unsectioned pieces (those without a
+    `""` fallback) fit. Pieces can still be dropped at or above it: omittable
+    ones skipped for lack of room, and those in a section that closed.
     When even the highest finite level isn't admitted, it is one above that
     level; when there are no finite-priority pieces (only `:infinity`, or
     nothing), it is `0`.

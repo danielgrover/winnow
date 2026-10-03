@@ -485,14 +485,16 @@ defmodule Winnow.Renderer do
     else
       usable = max(max_bytes - byte_size(@truncation_marker), 0)
 
-      # The prefix gets half the room, or just the first grapheme if that's
-      # bigger. The suffix's room depends only on `usable` and that first
-      # grapheme (not on where the prefix happened to cut), so both sides
-      # only grow as max_bytes grows — fit_content's search relies on it.
+      # Split the room in half, but give each end at least its outermost
+      # grapheme when there's room for both. Both rooms depend only on
+      # `usable` (not on where a cut landed) and never shrink as it grows —
+      # fit_content's search relies on that.
       first_size = original |> minimal_truncation(:end) |> byte_size()
-      prefix_room = max(div(usable, 2), first_size)
-      prefix = if prefix_room < usable, do: truncate_bytes(original, prefix_room), else: ""
-      suffix = truncate_bytes_from_end(original, usable - prefix_room)
+      last_size = original |> last_grapheme() |> byte_size()
+      suffix_room = min(max(usable - div(usable, 2), last_size), usable - first_size)
+      prefix_room = usable - suffix_room
+      prefix = if suffix_room >= 0, do: truncate_bytes(original, prefix_room), else: ""
+      suffix = if suffix_room > 0, do: truncate_bytes_from_end(original, suffix_room), else: ""
 
       # Both sides must carry content; a one-sided cut isn't a middle
       # truncation (and a bare marker carries nothing).
@@ -589,9 +591,43 @@ defmodule Winnow.Renderer do
     x = binary_part(string, prev, p - prev)
     y = string |> binary_part(p, min(4, byte_size(string) - p)) |> first_codepoint()
 
+    if regional_indicator?(x),
+      do: regional_indicator_boundary(string, p, y),
+      else: pairwise_safe_boundary(string, p, prev, x, y)
+  end
+
+  # Regional indicators pair up from the start of their run (GB12/13), so
+  # inside a run the boundaries are exactly every 8 bytes from its start.
+  # Finding the start is a fast byte scan, so long flag runs don't force
+  # re-segmenting the whole string. p is just after a regional indicator.
+  defp regional_indicator_boundary(string, p, y) do
+    run_start = regional_indicator_run_start(string, p)
+    candidate = run_start + 8 * div(p - run_start, 8)
+
+    cond do
+      # Start of the run: whether that's a boundary depends on what precedes it
+      candidate == run_start -> safe_boundary_at_or_before(string, run_start)
+      # Followed by another regional indicator inside the run: a boundary
+      candidate < p or regional_indicator?(y) -> candidate
+      # End of the run: a boundary unless y attaches (e.g. a combining mark)
+      match?([_, _], String.graphemes(binary_part(string, p - 4, 4) <> y)) -> candidate
+      candidate - 8 > run_start -> candidate - 8
+      true -> safe_boundary_at_or_before(string, run_start)
+    end
+  end
+
+  defp regional_indicator_run_start(string, p) when p >= 4 do
+    case binary_part(string, p - 4, 4) do
+      <<0xF0, 0x9F, 0x87, b>> when b in 0xA6..0xBF -> regional_indicator_run_start(string, p - 4)
+      _ -> p
+    end
+  end
+
+  defp regional_indicator_run_start(_string, p), do: p
+
+  defp pairwise_safe_boundary(string, p, prev, x, y) do
     lookbehind_risk? =
-      regional_indicator?(x) or
-        (x == "\u200D" and extended_pictographic?(y)) or
+      (x == "\u200D" and extended_pictographic?(y)) or
         (indic_consonant?(y) and linker_before?(string, p))
 
     if lookbehind_risk? or not match?([_, _], String.graphemes(x <> y)),

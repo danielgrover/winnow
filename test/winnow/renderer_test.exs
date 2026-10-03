@@ -295,7 +295,10 @@ defmodule Winnow.RendererTest do
   describe "property-based — truncation respects grapheme clusters" do
     # Includes a 12-flag run: longer than the boundary search's window, so a
     # window can start mid-flag.
+    # Includes a lone regional indicator, which shifts flag pairing for
+    # whatever follows it.
     @clusters [
+      "🇺",
       "a",
       "é",
       "e\u0301",
@@ -1210,6 +1213,41 @@ defmodule Winnow.RendererTest do
       end
     end
 
+    test ":truncate_middle uses its budget when the last grapheme is large" do
+      content = "a" <> String.duplicate("b", 200) <> "👨‍👩‍👧‍👦"
+
+      for budget <- 12..19 do
+        result =
+          Winnow.new(budget: budget)
+          |> Winnow.add(:user, priority: 1, content: content, overflow: :truncate_middle)
+          |> Winnow.render()
+
+        [%{content: cut}] = result.messages
+        assert String.starts_with?(cut, "a")
+        assert cut =~ " [...] "
+        assert String.ends_with?(cut, "👨‍👩‍👧‍👦")
+        assert result.total_tokens == budget
+      end
+    end
+
+    test "long flag runs truncate correctly in both modes, starting mid-pair too" do
+      for content <- [String.duplicate("🇺🇸", 50_000), "🇺" <> String.duplicate("🇺🇸", 50_000)],
+          mode <- [:truncate_end, :truncate_middle] do
+        result =
+          Winnow.new(budget: 500)
+          |> Winnow.add(:user, priority: 1, content: content, overflow: mode)
+          |> Winnow.render()
+
+        [%{content: cut}] = result.messages
+        g = String.graphemes(content)
+
+        for part <- String.split(cut, " [...] ") do
+          pg = String.graphemes(part)
+          assert pg == Enum.take(g, length(pg)) or pg == Enum.take(g, -length(pg))
+        end
+      end
+    end
+
     test ":truncate_middle output never shrinks as the budget grows" do
       e41 = "e" <> String.duplicate("\u0301", 20)
       e61 = "e" <> String.duplicate("\u0301", 30)
@@ -1511,6 +1549,20 @@ defmodule Winnow.RendererTest do
       for max_tokens <- [15, 16, 100] do
         assert Enum.map(render.(max_tokens).messages, & &1.content) == ["pppp"]
       end
+    end
+
+    test "pieces of a closed section can sit at or above the threshold" do
+      result =
+        Winnow.new(budget: 100)
+        |> Winnow.section(:s, max_tokens: 10)
+        |> Winnow.add(:user, priority: 10, content: String.duplicate("a", 80), section: :s)
+        |> Winnow.add(:user, priority: 5, content: "b", token_count: 5)
+        |> Winnow.add(:user, priority: 1, content: "c", section: :s)
+        |> Winnow.render()
+
+      assert Enum.map(result.messages, & &1.content) == ["b"]
+      assert result.threshold == 1
+      assert Enum.map(result.dropped, & &1.priority) |> Enum.sort() == [1, 10]
     end
 
     test "a section whose level overflows closes; the rest of the prompt carries on" do
