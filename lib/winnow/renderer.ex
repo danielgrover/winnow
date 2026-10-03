@@ -6,26 +6,27 @@ defmodule Winnow.Renderer do
   The pipeline:
 
   1. Evaluate conditions
-  2. Compute token counts for all pieces
-  3. Resolve sections within their own sub-budgets; each survivor gets a
-     cost cap (what the section allotted it), and is otherwise left as the
-     original piece
-  4. Admission, walking priority levels from highest to lowest with a
-     running total of each piece's cheapest non-empty form (smallest
-     fallback, or smallest non-empty truncation). A level is admitted if its
-     pieces fit; the first level that doesn't fit, and everything below it,
-     is rejected, and the threshold is the lowest admitted level. Pieces
-     with a `""` ("omit") fallback are admitted only if they fit at their
-     own level, and otherwise skipped without blocking lower levels.
-  5. Greedy pass in priority order: each admitted piece takes its primary, a
-     fallback, or a truncation — the best that fits within its section cap
-     after setting aside the minimum cost of every piece still pending
-  6. Sort by sequence, build messages, populate RenderResult
+  2. Compute token counts and each piece's cheapest non-empty form
+     (smallest fallback, or smallest non-empty truncation)
+  3. Admission, walking priority levels from highest to lowest with running
+     totals against the budget and each section's `max_tokens`. A level's
+     unsectioned pieces are admitted if they fit; the first level where
+     they don't, and everything below it, is rejected, and the threshold is
+     the lowest admitted level. Each section's pieces at an admitted level
+     go in as a group if they fit both limits, or else the section closes.
+     Pieces with a `""` ("omit") fallback are admitted individually if they
+     fit, and otherwise skipped without blocking anything.
+  4. Greedy pass in priority order: each admitted piece takes its primary, a
+     fallback, or a truncation — the best that fits in the budget and its
+     section after setting aside the minimum cost of every piece still
+     pending
+  5. Sort by sequence, build messages, populate RenderResult
 
-  Every admitted piece is included with real content. Adding budget never
-  drops a piece except in favour of one at least as important.
-  `Winnow.OversizedContentError` can only occur when `:infinity`-priority
-  pieces alone exceed the budget (or their section's `max_tokens`).
+  Every admitted piece is included with real content. Adding budget, or
+  raising a section's `max_tokens`, never drops a piece except in favour of
+  one at least as important. `Winnow.OversizedContentError` can only occur
+  when `:infinity`-priority pieces alone exceed the budget (or their
+  section's `max_tokens`).
   """
 
   alias Winnow.ContentPiece
@@ -40,27 +41,26 @@ defmodule Winnow.Renderer do
   def render(%Winnow{} = winnow) do
     tokenizer = winnow.tokenizer
     budget = winnow.budget
+    limits = Map.new(winnow.sections, fn {name, section} -> {name, section.max_tokens} end)
 
     # Step 1: Evaluate conditions — exclude pieces where condition is falsy
     {pieces, condition_excluded} = evaluate_conditions(winnow.pieces)
 
     # Step 2: Compute token costs. Each piece then travels as an entry
-    # {piece, cap}: always the caller's original piece, plus the most a
-    # section allows it to cost (nil when unsectioned). Rendering always
-    # starts from the original, so nothing is truncated twice and every
-    # fallback stays available to the main pass.
+    # {piece, section, min_cost}: the caller's original piece, the defined
+    # section it counts against (nil if none), and its cheapest non-empty
+    # form (computed once, since it may re-count large content).
     entries =
       pieces
       |> compute_token_costs(tokenizer)
-      |> Enum.map(&{&1, nil})
+      |> Enum.map(&{&1, defined_section(&1, limits), min_token_cost(&1, tokenizer)})
 
-    # Step 3: Render sections independently within their sub-budgets
-    {main_entries, section_dropped} = render_sections(entries, winnow.sections, tokenizer)
+    # Steps 3-4: Admit by priority level against the budget and section
+    # limits together, then greedily choose each admitted piece's form
+    {threshold, admitted, rejected} = admit(entries, budget, limits)
+    {rendered, dropped} = resolve_fit(admitted, budget, limits, tokenizer)
 
-    # Steps 4-5: Admit by priority level, then greedily fit
-    {threshold, rendered, main_dropped} = fit_entries(main_entries, budget, tokenizer, nil)
-
-    all_dropped = Enum.map(main_dropped ++ section_dropped, &entry_piece/1)
+    all_dropped = Enum.map(rejected ++ dropped, &entry_piece/1)
 
     all_fallbacks =
       for {original, _rendered, index} <- rendered, index != nil, do: {original, index}
@@ -107,82 +107,138 @@ defmodule Winnow.Renderer do
   @spec find_threshold([ContentPiece.t()], non_neg_integer(), module()) :: number()
   def find_threshold(pieces, budget, tokenizer) do
     {threshold, _admitted, _rejected} =
-      pieces |> Enum.map(&{&1, nil}) |> admit(budget, tokenizer)
+      pieces
+      |> Enum.map(&{&1, nil, min_token_cost(&1, tokenizer)})
+      |> admit(budget, %{})
 
     threshold
   end
 
+  # Pieces naming an undefined section are treated as unsectioned.
+  defp defined_section(%{section: section}, limits) do
+    if Map.has_key?(limits, section), do: section, else: nil
+  end
+
   # Decide which entries are eligible, walking priority levels from highest
-  # to lowest with a running total of each entry's cheapest cost.
+  # to lowest with running totals of each entry's cheapest cost — one for
+  # the budget, and one per section against its max_tokens.
   #
   # - :infinity entries are always admitted (if they overflow, the greedy
   #   pass raises), except omittable ones (with a "" fallback) that don't fit.
-  # - At each finite level, the non-omittable entries are admitted together
-  #   if they fit; if not, this level and everything below is rejected and
-  #   the threshold is the previous level.
+  # - At each finite level, the unsectioned non-omittable entries are
+  #   admitted together if they fit the budget; if not, this level and
+  #   everything below is rejected and the threshold is the previous level.
+  #   Then each section's non-omittable entries at that level are admitted
+  #   as a group if they fit both the section's max_tokens and the budget;
+  #   otherwise the section closes (see admit_section_groups/4).
   # - Omittable entries at an admitted level are admitted one by one (in
-  #   sequence order) if their smallest non-empty form fits, and otherwise
-  #   skipped without blocking lower levels. Omission is never used to make
-  #   room for lower-priority pieces.
+  #   sequence order) if their smallest non-empty form fits the budget and
+  #   their section, and otherwise skipped without blocking lower levels.
   #
-  # Without omittable entries this is exactly "the lowest threshold whose
-  # pieces fit in their cheapest forms". Returns {threshold, admitted, rejected}.
-  defp admit(entries, budget, tokenizer) do
-    costed = Enum.map(entries, &{&1, min_token_cost(entry_piece(&1), tokenizer)})
+  # Checking sections and the budget in one pass means a section never
+  # spends its room on a piece the budget can't hold. Without sections or
+  # omittable entries this is exactly "the lowest threshold whose pieces fit
+  # in their cheapest forms". Returns {threshold, admitted, rejected}.
+  defp admit(entries, budget, limits) do
+    {infinite, finite} = Enum.split_with(entries, &(entry_piece(&1).priority == :infinity))
+    {mandatory_inf, optional_inf} = Enum.split_with(infinite, &(not omittable?(entry_piece(&1))))
 
-    {infinite, finite} =
-      Enum.split_with(costed, fn {e, _} -> entry_piece(e).priority == :infinity end)
+    state = %{used: 0, section_used: %{}, closed: MapSet.new(), admitted: [], rejected: []}
+    state = Enum.reduce(mandatory_inf, state, &take(&2, &1))
+    state = admit_optional(optional_inf, state, budget, limits)
 
-    {mandatory_inf, optional_inf} =
-      Enum.split_with(infinite, fn {e, _} -> not omittable?(entry_piece(e)) end)
-
-    used = sum_costs(mandatory_inf)
-
-    {used, admitted, rejected} =
-      admit_optional(optional_inf, used, budget, entries_of(mandatory_inf), [])
-
-    levels =
-      finite
-      |> Enum.group_by(fn {e, _} -> entry_piece(e).priority end)
-      |> Enum.sort_by(fn {priority, _} -> priority end, :desc)
-
-    admit_levels(levels, used, budget, admitted, rejected, nil)
+    finite
+    |> Enum.group_by(&entry_piece(&1).priority)
+    |> Enum.sort_by(fn {priority, _} -> priority end, :desc)
+    |> admit_levels(state, budget, limits, nil)
   end
 
-  defp admit_levels([], _used, _budget, admitted, rejected, last_level),
-    do: {last_level || 0, admitted, rejected}
+  # Lists are built by prepending; their order doesn't matter (resolve_fit
+  # sorts admitted entries, and rejected ones are only reported).
+  defp admit_levels([], state, _budget, _limits, last_level),
+    do: {last_level || 0, state.admitted, state.rejected}
 
-  defp admit_levels([{priority, level} | lower], used, budget, admitted, rejected, last_level) do
-    {mandatory, optional} =
-      Enum.split_with(level, fn {e, _} -> not omittable?(entry_piece(e)) end)
+  defp admit_levels([{priority, level} | lower], state, budget, limits, last_level) do
+    {mandatory, optional} = Enum.split_with(level, &(not omittable?(entry_piece(&1))))
+    {unsectioned, sectioned} = Enum.split_with(mandatory, &(entry_section(&1) == nil))
 
-    level_used = used + sum_costs(mandatory)
-
-    if level_used > budget do
-      rejected_rest = entries_of(level) ++ Enum.flat_map(lower, fn {_, l} -> entries_of(l) end)
-      {last_level || priority + 1, admitted, rejected ++ rejected_rest}
+    if state.used + sum_costs(unsectioned) > budget do
+      rejected_rest = level ++ Enum.flat_map(lower, fn {_, l} -> l end)
+      {last_level || priority + 1, state.admitted, rejected_rest ++ state.rejected}
     else
-      {used, admitted, rejected} =
-        admit_optional(optional, level_used, budget, admitted ++ entries_of(mandatory), rejected)
+      state =
+        unsectioned
+        |> Enum.reduce(state, &take(&2, &1))
+        |> admit_section_groups(sectioned, budget, limits)
+        |> then(&admit_optional(optional, &1, budget, limits))
 
-      admit_levels(lower, used, budget, admitted, rejected, priority)
+      admit_levels(lower, state, budget, limits, priority)
     end
   end
 
-  defp admit_optional(costed, used, budget, admitted, rejected) do
-    costed
-    |> Enum.sort_by(fn {e, _} -> entry_piece(e).sequence end)
-    |> Enum.reduce({used, admitted, rejected}, fn {entry, cost}, {used, admitted, rejected} ->
-      if used + cost <= budget,
-        do: {used + cost, admitted ++ [entry], rejected},
-        else: {used, admitted, rejected ++ [entry]}
+  # Each section's pieces at a level go in all-or-nothing, groups in order of
+  # their earliest sequence, if they fit both the section and the budget. A
+  # group that doesn't fit closes its section (it and everything below it in
+  # that section is rejected) rather than blocking the rest of the prompt —
+  # so giving a section more room can never push out unrelated pieces.
+  defp admit_section_groups(state, sectioned, budget, limits) do
+    sectioned
+    |> Enum.group_by(&entry_section/1)
+    |> Enum.sort_by(fn {_section, entries} ->
+      entries |> Enum.map(&entry_piece(&1).sequence) |> Enum.min()
+    end)
+    |> Enum.reduce(state, fn {section, entries}, state ->
+      cost = sum_costs(entries)
+
+      fits? =
+        open?(state, hd(entries)) and state.used + cost <= budget and
+          Map.get(state.section_used, section, 0) + cost <= Map.fetch!(limits, section)
+
+      if fits?,
+        do: Enum.reduce(entries, state, &take(&2, &1)),
+        else: %{
+          state
+          | closed: MapSet.put(state.closed, section),
+            rejected: entries ++ state.rejected
+        }
     end)
   end
 
-  defp entries_of(costed), do: Enum.map(costed, &elem(&1, 0))
-  defp sum_costs(costed), do: Enum.reduce(costed, 0, fn {_, cost}, acc -> acc + cost end)
+  defp admit_optional(entries, state, budget, limits) do
+    entries
+    |> Enum.sort_by(&entry_piece(&1).sequence)
+    |> Enum.reduce(state, fn entry, state ->
+      if open?(state, entry) and fits?(state, entry, budget, limits),
+        do: take(state, entry),
+        else: %{state | rejected: [entry | state.rejected]}
+    end)
+  end
 
-  defp entry_piece({piece, _cap}), do: piece
+  defp fits?(state, {_piece, section, cost}, budget, limits) do
+    state.used + cost <= budget and
+      (section == nil or Map.get(state.section_used, section, 0) + cost <= limits[section])
+  end
+
+  defp take(state, {_piece, section, cost} = entry) do
+    section_used =
+      if section,
+        do: Map.update(state.section_used, section, cost, &(&1 + cost)),
+        else: state.section_used
+
+    %{
+      state
+      | used: state.used + cost,
+        section_used: section_used,
+        admitted: [entry | state.admitted]
+    }
+  end
+
+  defp open?(state, entry), do: not MapSet.member?(state.closed, entry_section(entry))
+
+  defp sum_costs(entries), do: Enum.reduce(entries, 0, fn {_, _, cost}, acc -> acc + cost end)
+
+  defp entry_piece({piece, _section, _min_cost}), do: piece
+  defp entry_section({_piece, section, _min_cost}), do: section
 
   defp omittable?(piece), do: "" in piece.fallbacks
 
@@ -227,82 +283,64 @@ defmodule Winnow.Renderer do
     end)
   end
 
-  # Render sections independently with their own sub-budgets. Returns
-  # {main_entries, section_dropped}: unsectioned entries plus each section's
-  # survivors, capped at the cost the section gave them. Survivors keep their
-  # priorities and compete individually in the main pass, which renders them
-  # from the original again, within the cap (so it may pick a cheaper form,
-  # but never a costlier one). Pieces naming an undefined section are treated
-  # as unsectioned.
-  defp render_sections(entries, sections, tokenizer) do
-    {sectioned, unsectioned} =
-      Enum.split_with(entries, &Map.has_key?(sections, entry_piece(&1).section))
-
-    results =
-      sectioned
-      |> Enum.group_by(&entry_piece(&1).section)
-      |> Enum.map(fn {name, section_entries} ->
-        section = Map.fetch!(sections, name)
-
-        {_threshold, rendered, dropped} =
-          fit_entries(section_entries, section.max_tokens, tokenizer, name)
-
-        survivors =
-          Enum.map(rendered, fn {original, piece, _index} -> {original, piece.token_count} end)
-
-        {survivors, dropped}
-      end)
-
-    {unsectioned ++ Enum.flat_map(results, &elem(&1, 0)), Enum.flat_map(results, &elem(&1, 1))}
-  end
-
-  # Admit entries by priority, then greedily fit the admitted ones. `scope`
-  # is the section name (nil for the main pass), used for error context.
-  # Returns {threshold, rendered, dropped} where rendered holds
-  # {original, rendered_piece, fallback_index_or_nil}.
-  defp fit_entries(entries, budget, tokenizer, scope) do
-    {threshold, admitted, rejected} = admit(entries, budget, tokenizer)
-    {rendered, dropped} = resolve_fit(admitted, budget, tokenizer, scope)
-    {threshold, rendered, rejected ++ dropped}
-  end
-
   # Greedy post-admission pass: choose each piece's form.
   #
   # Entries are visited in priority order (highest first, ties by sequence).
-  # Each may only consume what's left after setting aside the minimum cost
-  # of every entry still pending (and no more than its section cap). Since
-  # admission guarantees the minimum costs fit, every admitted entry gets at
-  # least its cheapest non-empty form, and spare budget upgrades the most
+  # Each may only consume what's left — in the budget and in its section —
+  # after setting aside the minimum cost of every entry still pending there.
+  # Since admission guarantees those minimums fit, every admitted entry gets
+  # at least its cheapest non-empty form, and spare room upgrades the most
   # important pieces first (primary over fallback, longer truncation).
-  defp resolve_fit(entries, budget, tokenizer, scope) do
-    costed =
-      entries
-      |> Enum.map(&{&1, min_token_cost(entry_piece(&1), tokenizer)})
-      |> Enum.sort_by(fn {entry, _cost} -> fit_order_key(entry_piece(entry)) end)
+  # Returns {rendered, dropped} with rendered as
+  # {original, rendered_piece, fallback_index_or_nil}.
+  defp resolve_fit(entries, budget, limits, tokenizer) do
+    sorted = Enum.sort_by(entries, &fit_order_key(entry_piece(&1)))
 
-    pending = sum_costs(costed)
+    pending =
+      Enum.reduce(sorted, %{nil => 0}, fn {_, section, cost}, acc ->
+        charge(acc, section, cost)
+      end)
+
+    remaining = Map.put(limits, nil, budget)
 
     {rendered, dropped, _remaining, _pending} =
-      Enum.reduce(costed, {[], [], budget, pending}, fn {{piece, cap} = entry, min_cost},
-                                                        {rendered, dropped, remaining, pending} ->
-        pending = pending - min_cost
-        available = min(remaining - pending, cap || remaining - pending)
+      Enum.reduce(sorted, {[], [], remaining, pending}, fn {piece, section, min_cost} = entry,
+                                                           {rendered, dropped, remaining, pending} ->
+        pending = charge(pending, section, -min_cost)
+        {available, scope} = available(remaining, pending, section)
 
         case fit_piece(piece, available, tokenizer, scope) do
-          {:included, resolved} ->
-            {[{piece, resolved, nil} | rendered], dropped, remaining - resolved.token_count,
-             pending}
-
-          {:fallback, resolved, index} ->
-            {[{piece, resolved, index} | rendered], dropped, remaining - resolved.token_count,
-             pending}
-
           :dropped ->
             {rendered, [entry | dropped], remaining, pending}
+
+          {_form, resolved, index} ->
+            remaining = charge(remaining, section, -resolved.token_count)
+            {[{piece, resolved, index} | rendered], dropped, remaining, pending}
         end
       end)
 
     {Enum.reverse(rendered), Enum.reverse(dropped)}
+  end
+
+  # Apply `amount` to the budget (key nil) and, if any, the piece's section.
+  defp charge(totals, section, amount) do
+    totals = Map.update(totals, nil, amount, &(&1 + amount))
+    if section, do: Map.update(totals, section, amount, &(&1 + amount)), else: totals
+  end
+
+  # Room left for a piece: the tighter of the budget and its section, each
+  # net of pending minimums. `scope` names the section when it's the binding
+  # constraint (for error messages).
+  defp available(remaining, pending, section) do
+    main = remaining[nil] - pending[nil]
+
+    with section when section != nil <- section,
+         in_section = remaining[section] - pending[section],
+         true <- in_section < main do
+      {in_section, section}
+    else
+      _ -> {main, nil}
+    end
   end
 
   defp fit_order_key(%{priority: :infinity, sequence: seq}), do: {0, 0, seq}
@@ -310,7 +348,7 @@ defmodule Winnow.Renderer do
 
   defp fit_piece(piece, available, tokenizer, scope) do
     if piece.token_count <= available do
-      {:included, piece}
+      {:primary, piece, nil}
     else
       try_fallbacks(piece, available, tokenizer, scope)
     end
@@ -365,7 +403,7 @@ defmodule Winnow.Renderer do
         # No room for any content — report as dropped rather than as an
         # "included" piece that produces no message but still costs overhead.
         %{content: ""} -> :dropped
-        truncated -> {:included, truncated}
+        truncated -> {:truncated, truncated, nil}
       end
     end
   end
@@ -446,27 +484,21 @@ defmodule Winnow.Renderer do
       original
     else
       usable = max(max_bytes - byte_size(@truncation_marker), 0)
-      prefix = middle_prefix(original, usable)
-      suffix = truncate_bytes_from_end(original, usable - byte_size(prefix))
+
+      # The prefix gets half the room, or just the first grapheme if that's
+      # bigger. The suffix's room depends only on `usable` and that first
+      # grapheme (not on where the prefix happened to cut), so both sides
+      # only grow as max_bytes grows — fit_content's search relies on it.
+      first_size = original |> minimal_truncation(:end) |> byte_size()
+      prefix_room = max(div(usable, 2), first_size)
+      prefix = if prefix_room < usable, do: truncate_bytes(original, prefix_room), else: ""
+      suffix = truncate_bytes_from_end(original, usable - prefix_room)
 
       # Both sides must carry content; a one-sided cut isn't a middle
       # truncation (and a bare marker carries nothing).
       if prefix == "" or suffix == "",
         do: "",
         else: prefix <> @truncation_marker <> suffix
-    end
-  end
-
-  # Prefix gets half the room — or, if its first grapheme is bigger than
-  # that, just the first grapheme, leaving the rest to the suffix.
-  defp middle_prefix(original, usable) do
-    case truncate_bytes(original, div(usable, 2)) do
-      "" ->
-        first = minimal_truncation(original, :end)
-        if byte_size(first) < usable, do: first, else: ""
-
-      prefix ->
-        prefix
     end
   end
 
@@ -547,8 +579,8 @@ defmodule Winnow.Renderer do
   # Nearest codepoint boundary at or before p that is certainly a grapheme
   # boundary. Pairwise segmentation (x <> y splitting) can be fooled only by
   # rules that look further back: regional-indicator pairing (flags, GB12/13),
-  # emoji ZWJ sequences (GB11: x is ZWJ), and Indic conjuncts (GB9c: x is a
-  # linker/extend mark and y an Indic consonant). Positions matching those
+  # emoji ZWJ sequences (GB11: x is ZWJ and y an emoji), and conjuncts (GB9c:
+  # y is an InCB consonant after marks that include a linker). Positions matching those
   # are skipped; anything else that splits pairwise is a real boundary.
   defp safe_boundary_at_or_before(_string, 0), do: 0
 
@@ -558,16 +590,45 @@ defmodule Winnow.Renderer do
     y = string |> binary_part(p, min(4, byte_size(string) - p)) |> first_codepoint()
 
     lookbehind_risk? =
-      regional_indicator?(x) or x == "\u200D" or (attaches?(x) and indic_consonant?(y))
+      regional_indicator?(x) or
+        (x == "\u200D" and extended_pictographic?(y)) or
+        (indic_consonant?(y) and linker_before?(string, p))
 
     if lookbehind_risk? or not match?([_, _], String.graphemes(x <> y)),
       do: safe_boundary_at_or_before(string, prev),
       else: p
   end
 
-  # Scripts with InCB=Consonant (GB9c): Devanagari through Malayalam.
-  defp indic_consonant?(<<codepoint::utf8>>), do: codepoint in 0x0900..0x0D7F
-  defp indic_consonant?(_), do: false
+  # These classify codepoints by asking Elixir's own segmenter, so they track
+  # its Unicode version (e.g. GB9c covers Devanagari, Myanmar, Sinhala,
+  # Khmer, ... — whatever the tables assign).
+
+  # InCB=Consonant: joins a preceding consonant + virama.
+  defp indic_consonant?(""), do: false
+  defp indic_consonant?(y), do: match?([_], String.graphemes("क्" <> y))
+
+  # InCB=Linker (a virama): makes two consonants one cluster.
+  defp linker?(codepoint), do: match?([_], String.graphemes("क" <> codepoint <> "क"))
+
+  # Extended_Pictographic: joins after an emoji + ZWJ (GB11).
+  defp extended_pictographic?(""), do: false
+  defp extended_pictographic?(y), do: match?([_], String.graphemes("👨\u200D" <> y))
+
+  # Is there a linker among the combining marks just before p? GB9c only
+  # joins a consonant across such a run when it contains one; vowel signs
+  # alone (e.g. "का" repeated) don't, so those positions stay safe.
+  defp linker_before?(_string, p) when p <= 0, do: false
+
+  defp linker_before?(string, p) do
+    prev = codepoint_start_before(string, p - 1)
+    codepoint = binary_part(string, prev, p - prev)
+
+    cond do
+      linker?(codepoint) -> true
+      attaches?(codepoint) -> linker_before?(string, prev)
+      true -> false
+    end
+  end
 
   defp first_codepoint(binary) do
     case String.next_codepoint(binary) do

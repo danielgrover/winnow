@@ -126,7 +126,7 @@ Winnow.new(budget: 128_000)
 |> Winnow.add(:user, priority: 500, content: "...", section: :memory)
 ```
 
-Pieces within a section compete against each other within the section's budget. Survivors then compete individually, by their own priorities, in the main render — a section caps how much its pieces can use but never guarantees them space.
+A section caps how much its pieces can use, but never guarantees them space. Its pieces are admitted with everything else, priority level by priority level, counting against both the section's `max_tokens` and the overall budget. If a section's pieces at some level don't fit, that section closes (those pieces and its lower-priority ones are dropped) while the rest of the prompt carries on.
 
 ### Conditions
 

@@ -98,19 +98,37 @@ defmodule Winnow do
   """
   @spec add(t(), atom(), keyword()) :: t()
   def add(%__MODULE__{} = winnow, role, opts) do
+    {piece, winnow} = build_piece(winnow, role, opts)
+    # Append is O(n) per call, O(n²) over many calls. Acceptable for typical
+    # prompt piece counts (tens to low hundreds); add_each/3 and add_tools/3
+    # append their whole batch at once.
+    %{winnow | pieces: winnow.pieces ++ [piece]}
+  end
+
+  # Validates opts and builds the piece, advancing next_sequence, without
+  # appending it.
+  defp build_piece(winnow, role, opts) do
     opts = validate_opts!(opts, @piece_options, [:priority, :content])
     {sequence, winnow} = next_sequence(winnow, opts)
 
-    piece_attrs =
+    piece =
       opts
       |> Keyword.put(:role, role)
       |> Keyword.put(:sequence, sequence)
+      |> ContentPiece.new!()
 
-    piece = ContentPiece.new!(piece_attrs)
-    # Append is O(n) per call, O(n²) total. Acceptable for typical prompt
-    # piece counts (tens to low hundreds). Preserves insertion order without
-    # a final reverse step, keeping the public API simple.
-    %{winnow | pieces: winnow.pieces ++ [piece]}
+    {piece, winnow}
+  end
+
+  # Builds one piece per opts list and appends them in a single step.
+  defp add_batch(winnow, role, opts_list) do
+    {pieces, winnow} =
+      Enum.reduce(opts_list, {[], winnow}, fn opts, {pieces, acc} ->
+        {piece, acc} = build_piece(acc, role, opts)
+        {[piece | pieces], acc}
+      end)
+
+    %{winnow | pieces: winnow.pieces ++ Enum.reverse(pieces)}
   end
 
   @doc """
@@ -141,12 +159,21 @@ defmodule Winnow do
     opts = validate_opts!(opts, allowed, [:items, :formatter])
     items = Keyword.fetch!(opts, :items)
     formatter = Keyword.fetch!(opts, :formatter)
+
+    unless is_list(items) do
+      raise ArgumentError, "invalid items: #{inspect(items)}, must be a list"
+    end
+
     priority_fn = priority_function(opts)
     metadata_fn = Keyword.get(opts, :metadata_fn)
 
     unless is_function(formatter, 1) do
       raise ArgumentError,
             "invalid formatter: #{inspect(formatter)}, must be a function of arity 1"
+    end
+
+    if metadata_fn && Keyword.has_key?(opts, :metadata) do
+      raise ArgumentError, "provide either :metadata or :metadata_fn, not both"
     end
 
     unless is_nil(metadata_fn) or is_function(metadata_fn, 1) or is_function(metadata_fn, 2) do
@@ -156,18 +183,18 @@ defmodule Winnow do
 
     base_opts = Keyword.drop(opts, [:items, :formatter, :priority_fn, :metadata_fn])
 
-    {winnow, _count} =
-      Enum.reduce(items, {winnow, 0}, fn item, {acc, index} ->
+    {opts_list, _count} =
+      Enum.map_reduce(items, 0, fn item, index ->
         piece_opts =
           base_opts
           |> Keyword.put(:content, formatter.(item))
           |> Keyword.put(:priority, priority_fn.(item, index))
           |> put_metadata(metadata_fn, item, index)
 
-        {add(acc, role, piece_opts), index + 1}
+        {piece_opts, index + 1}
       end)
 
-    winnow
+    add_batch(winnow, role, opts_list)
   end
 
   defp put_metadata(opts, nil, _item, _index), do: opts
@@ -199,16 +226,20 @@ defmodule Winnow do
     allowed = [:priority, :token_count, :section, :cacheable, :condition, :name, :fallbacks]
     opts = validate_opts!(opts, allowed, [:priority])
 
-    Enum.reduce(tools, winnow, fn
-      tool, acc when is_map(tool) ->
-        piece_opts =
+    unless is_list(tools) do
+      raise ArgumentError, "invalid tools: #{inspect(tools)}, must be a list of maps"
+    end
+
+    opts_list =
+      Enum.map(tools, fn
+        tool when is_map(tool) ->
           Keyword.merge(opts, content: tool_content(tool), type: :tool_def, metadata: tool)
 
-        add(acc, :system, piece_opts)
+        tool ->
+          raise ArgumentError, "invalid tool: #{inspect(tool)}, must be a map"
+      end)
 
-      tool, _acc ->
-        raise ArgumentError, "invalid tool: #{inspect(tool)}, must be a map"
-    end)
+    add_batch(winnow, :system, opts_list)
   end
 
   @doc """
@@ -239,9 +270,8 @@ defmodule Winnow do
   @doc """
   Defines a named section with a token budget cap.
 
-  Pieces added with `section: name` first compete within that section's
-  sub-budget; survivors then compete individually in the main render.
-  See `Winnow.Section`.
+  Pieces added with `section: name` count against both this cap and the
+  overall budget. See `Winnow.Section`.
 
   ## Options
 
@@ -336,9 +366,16 @@ defmodule Winnow do
       raise ArgumentError, "expected a keyword list of options, got: #{inspect(opts)}"
     end
 
-    case Keyword.keys(opts) -- allowed do
+    keys = Keyword.keys(opts)
+
+    case keys |> Enum.reject(&(&1 in allowed)) |> Enum.uniq() do
       [] -> :ok
-      unknown -> raise ArgumentError, "unknown option(s) #{inspect(Enum.uniq(unknown))}"
+      unknown -> raise ArgumentError, "unknown option(s) #{inspect(unknown)}"
+    end
+
+    case Enum.uniq(keys -- Enum.uniq(keys)) do
+      [] -> :ok
+      duplicated -> raise ArgumentError, "duplicate option(s) #{inspect(duplicated)}"
     end
 
     case required -- Keyword.keys(opts) do

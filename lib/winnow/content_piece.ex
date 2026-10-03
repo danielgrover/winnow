@@ -241,6 +241,9 @@ defmodule Winnow.ContentPiece do
       Enum.any?(Map.get(attrs, :fallbacks, []), &(&1 != "")) ->
         {:error, "invalid fallbacks for :tool_def: only \"\" (omit) is allowed"}
 
+      is_nil(Map.get(attrs, :metadata)) ->
+        {:error, "missing metadata for :tool_def: it's what RenderResult.tools returns"}
+
       true ->
         :ok
     end

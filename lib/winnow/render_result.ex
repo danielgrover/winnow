@@ -13,10 +13,12 @@ defmodule Winnow.RenderResult do
   - `total_tokens` — tokens consumed by included pieces, including reservations
     and tool definitions (so it can exceed what `messages` alone cost)
   - `budget` — the original token budget
-  - `threshold` — the computed priority threshold: pieces with priority at or
-    above it were eligible. When no finite-priority piece fits, it is one
-    above the highest priority present; when there are no finite-priority
-    pieces at all (only `:infinity`, or nothing), it is `0`.
+  - `threshold` — the lowest admitted priority level. Levels are admitted
+    from highest to lowest while their pieces (those without a `""` fallback)
+    fit; omittable pieces skipped for lack of room can sit at or above it.
+    When even the highest finite level isn't admitted, it is one above that
+    level; when there are no finite-priority pieces (only `:infinity`, or
+    nothing), it is `0`.
   - `included` — `ContentPiece` structs that made the cut, as rendered (content
     may be a fallback or truncated; `token_count` is the actual cost)
   - `dropped` — `ContentPiece` structs that didn't fit, in their original form
