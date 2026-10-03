@@ -51,6 +51,9 @@ defmodule Winnow do
     budget = Keyword.fetch!(opts, :budget)
     tokenizer = Keyword.get(opts, :tokenizer, Winnow.Tokenizer.Approximate)
 
+    validate_non_neg_integer!(:budget, budget)
+    validate_tokenizer!(tokenizer)
+
     %__MODULE__{budget: budget, tokenizer: tokenizer}
   end
 
@@ -63,12 +66,16 @@ defmodule Winnow do
   - `content` (required) — text content string
   - `sequence` — explicit sequence number (auto-incremented by default)
   - `token_count` — pre-computed token count (skips tokenizer)
-  - `fallbacks` — list of fallback content strings
+  - `fallbacks` — list of fallback content strings (`""` means omit)
   - `section` — atom naming a sub-budget section
   - `cacheable` — boolean hint for cache-friendly ordering
   - `type` — `:text`, `:image`, `:tool_def`, or `:file`
-  - `condition` — zero-arity function; piece excluded at render time if it returns `false`
+  - `condition` — zero-arity function; piece excluded at render time if it returns
+    a falsy value (`false` or `nil`)
   - `overflow` — `:error`, `:truncate_end`, or `:truncate_middle`
+  - `name` — optional atom identifier for the piece
+  - `metadata` — arbitrary term carried through to `RenderResult.included`/`dropped`
+    (e.g. `{:story, 41}`), useful for knowing which source items made the budget
   """
   @spec add(t(), atom(), keyword()) :: t()
   def add(%__MODULE__{} = winnow, role, opts) do
@@ -165,6 +172,7 @@ defmodule Winnow do
   @spec reserve(t(), atom(), keyword()) :: t()
   def reserve(%__MODULE__{} = winnow, name, opts) do
     tokens = Keyword.fetch!(opts, :tokens)
+    validate_non_neg_integer!(:tokens, tokens)
 
     add(winnow, :system,
       priority: :infinity,
@@ -177,8 +185,9 @@ defmodule Winnow do
   @doc """
   Defines a named section with a token budget cap.
 
-  Pieces added with `section: name` will compete within that section's
-  sub-budget before appearing as fixed-cost blocks in the main render.
+  Pieces added with `section: name` first compete within that section's
+  sub-budget; survivors then compete individually in the main render.
+  See `Winnow.Section`.
 
   ## Options
 
@@ -187,6 +196,7 @@ defmodule Winnow do
   @spec section(t(), atom(), keyword()) :: t()
   def section(%__MODULE__{} = winnow, name, opts) do
     max_tokens = Keyword.fetch!(opts, :max_tokens)
+    validate_non_neg_integer!(:max_tokens, max_tokens)
     section = %Winnow.Section{name: name, max_tokens: max_tokens}
     %{winnow | sections: Map.put(winnow.sections, name, section)}
   end
@@ -247,6 +257,23 @@ defmodule Winnow do
       explicit ->
         next = max(winnow.next_sequence, explicit + 1)
         {explicit, %{winnow | next_sequence: next}}
+    end
+  end
+
+  defp validate_non_neg_integer!(_key, value) when is_integer(value) and value >= 0, do: :ok
+
+  defp validate_non_neg_integer!(key, value) do
+    raise ArgumentError, "invalid #{key}: #{inspect(value)}, must be a non-negative integer"
+  end
+
+  defp validate_tokenizer!(tokenizer) do
+    if is_atom(tokenizer) and Code.ensure_loaded?(tokenizer) and
+         function_exported?(tokenizer, :count_tokens, 1) and
+         function_exported?(tokenizer, :message_overhead, 0) do
+      :ok
+    else
+      raise ArgumentError,
+            "invalid tokenizer: #{inspect(tokenizer)}, must be a module implementing Winnow.Tokenizer"
     end
   end
 

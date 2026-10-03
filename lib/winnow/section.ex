@@ -3,8 +3,13 @@ defmodule Winnow.Section do
   A named section with a token budget cap.
 
   Sections allow sub-budget control — pieces tagged with a section name
-  compete only within that section's budget before being included as a
-  fixed-cost block in the main render pass.
+  first compete within that section's budget. The survivors (with any
+  fallbacks or truncation already applied) then compete individually, by
+  their own priorities, in the main render pass. A section therefore caps
+  how much its pieces can use; it never guarantees them space.
+
+  Pieces tagged with a section name that was never defined are treated as
+  ordinary main-pass pieces.
   """
 
   @type t :: %__MODULE__{

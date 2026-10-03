@@ -17,13 +17,14 @@ defmodule Winnow.ContentPiece do
   ## Optional Fields
 
   - `token_count` — pre-computed token count (skips tokenizer call)
-  - `fallbacks` — ordered list of fallback content strings
+  - `fallbacks` — ordered list of fallback content strings (`""` means omit)
   - `section` — atom naming a sub-budget section
   - `cacheable` — hint for cache-friendly ordering (default `false`)
   - `type` — `:text`, `:image`, `:tool_def`, or `:file` (default `:text`).
     Only `:tool_def` has library-level behavior (populates `RenderResult.tools`);
     the others are semantic markers for caller use.
-  - `condition` — zero-arity function; piece excluded if it returns `false`
+  - `condition` — zero-arity function, evaluated at render time; piece excluded
+    if it returns a falsy value (`false` or `nil`)
   - `overflow` — `:error`, `:truncate_end`, or `:truncate_middle` (default `:error`)
   - `name` — optional identifier (e.g. for reservations)
   - `metadata` — optional arbitrary data (e.g. original tool map)
@@ -87,7 +88,13 @@ defmodule Winnow.ContentPiece do
          :ok <- validate_priority(attrs),
          :ok <- validate_content(attrs),
          :ok <- validate_overflow(attrs),
-         :ok <- validate_type(attrs) do
+         :ok <- validate_type(attrs),
+         :ok <- validate_token_count(attrs),
+         :ok <- validate_fallbacks(attrs),
+         :ok <- validate_section(attrs),
+         :ok <- validate_condition(attrs),
+         :ok <- validate_cacheable(attrs),
+         :ok <- validate_name(attrs) do
       {:ok, struct!(__MODULE__, attrs)}
     end
   end
@@ -143,4 +150,51 @@ defmodule Winnow.ContentPiece do
   defp validate_type(%{type: type}) when type in @valid_types, do: :ok
   defp validate_type(%{type: type}), do: {:error, "invalid type: #{inspect(type)}"}
   defp validate_type(_attrs), do: :ok
+
+  defp validate_token_count(%{token_count: n}) when is_nil(n) or (is_integer(n) and n >= 0),
+    do: :ok
+
+  defp validate_token_count(%{token_count: n}),
+    do: {:error, "invalid token_count: #{inspect(n)}, must be a non-negative integer"}
+
+  defp validate_token_count(_attrs), do: :ok
+
+  defp validate_fallbacks(%{fallbacks: fallbacks}) when is_list(fallbacks) do
+    if Enum.all?(fallbacks, &is_binary/1),
+      do: :ok,
+      else: {:error, "invalid fallbacks: #{inspect(fallbacks)}, must be a list of strings"}
+  end
+
+  defp validate_fallbacks(%{fallbacks: fallbacks}),
+    do: {:error, "invalid fallbacks: #{inspect(fallbacks)}, must be a list of strings"}
+
+  defp validate_fallbacks(_attrs), do: :ok
+
+  defp validate_section(%{section: section}) when is_atom(section), do: :ok
+
+  defp validate_section(%{section: section}),
+    do: {:error, "invalid section: #{inspect(section)}, must be an atom"}
+
+  defp validate_section(_attrs), do: :ok
+
+  defp validate_condition(%{condition: c}) when is_nil(c) or is_function(c, 0), do: :ok
+
+  defp validate_condition(%{condition: c}),
+    do: {:error, "invalid condition: #{inspect(c)}, must be a zero-arity function"}
+
+  defp validate_condition(_attrs), do: :ok
+
+  defp validate_cacheable(%{cacheable: c}) when is_boolean(c), do: :ok
+
+  defp validate_cacheable(%{cacheable: c}),
+    do: {:error, "invalid cacheable: #{inspect(c)}, must be a boolean"}
+
+  defp validate_cacheable(_attrs), do: :ok
+
+  defp validate_name(%{name: name}) when is_atom(name), do: :ok
+
+  defp validate_name(%{name: name}),
+    do: {:error, "invalid name: #{inspect(name)}, must be an atom"}
+
+  defp validate_name(_attrs), do: :ok
 end

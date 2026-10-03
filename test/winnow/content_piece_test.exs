@@ -99,6 +99,42 @@ defmodule Winnow.ContentPieceTest do
     end
   end
 
+  describe "new/1 — optional field validation" do
+    for {field, bad} <- [
+          token_count: -1,
+          token_count: 1.5,
+          fallbacks: "not a list",
+          fallbacks: ["ok", :not_a_string],
+          section: "memory",
+          condition: true,
+          condition: quote(do: fn _x -> true end),
+          cacheable: "yes",
+          name: "response"
+        ] do
+      test "rejects #{field}: #{Macro.to_string(bad)}" do
+        bad = unquote(bad)
+        expected = "invalid #{unquote(field)}"
+
+        assert {:error, msg} = ContentPiece.new(Map.put(@valid_attrs, unquote(field), bad))
+        assert msg =~ expected
+      end
+    end
+
+    test "accepts valid optional fields" do
+      attrs =
+        Map.merge(@valid_attrs, %{
+          token_count: 0,
+          fallbacks: ["short"],
+          section: :memory,
+          condition: fn -> true end,
+          cacheable: true,
+          name: :intro
+        })
+
+      assert {:ok, _piece} = ContentPiece.new(attrs)
+    end
+  end
+
   describe "new!/1" do
     test "returns piece on valid input" do
       piece = ContentPiece.new!(role: :user, content: "Hi", priority: 500, sequence: 1)

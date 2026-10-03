@@ -475,4 +475,35 @@ defmodule WinnowTest do
                )
     end
   end
+
+  describe "argument validation" do
+    test "new/1 rejects negative or non-integer budget" do
+      assert_raise ArgumentError, ~r/invalid budget/, fn -> Winnow.new(budget: -1) end
+      assert_raise ArgumentError, ~r/invalid budget/, fn -> Winnow.new(budget: 100.0) end
+    end
+
+    test "new/1 rejects a module that doesn't implement Winnow.Tokenizer" do
+      assert_raise ArgumentError, ~r/invalid tokenizer/, fn ->
+        Winnow.new(budget: 100, tokenizer: String)
+      end
+    end
+
+    test "reserve/3 rejects negative tokens" do
+      assert_raise ArgumentError, ~r/invalid tokens/, fn ->
+        Winnow.new(budget: 100) |> Winnow.reserve(:response, tokens: -5)
+      end
+    end
+
+    test "section/3 rejects non-integer max_tokens" do
+      assert_raise ArgumentError, ~r/invalid max_tokens/, fn ->
+        Winnow.new(budget: 100) |> Winnow.section(:memory, max_tokens: 30.5)
+      end
+    end
+
+    test "add/3 rejects non-string fallbacks" do
+      assert_raise ArgumentError, ~r/invalid fallbacks/, fn ->
+        Winnow.new(budget: 100) |> Winnow.add(:user, priority: 1, content: "x", fallbacks: [1])
+      end
+    end
+  end
 end

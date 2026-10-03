@@ -106,7 +106,7 @@ Winnow.add(:user,
 )
 ```
 
-The renderer tries the primary first, then each fallback in order, then omits.
+The renderer tries the primary first, then each fallback in order, then omits. An empty-string fallback (`""`) explicitly means "omit" — the piece is reported in `dropped`.
 
 ### Sections (Sub-budgets)
 
@@ -118,7 +118,7 @@ Winnow.new(budget: 128_000)
 |> Winnow.add(:user, priority: 500, content: "...", section: :memory)
 ```
 
-Pieces within a section compete against each other within the section's budget, then appear as fixed-cost blocks in the main render.
+Pieces within a section compete against each other within the section's budget. Survivors then compete individually, by their own priorities, in the main render — a section caps how much its pieces can use but never guarantees them space.
 
 ### Conditions
 
@@ -143,6 +143,10 @@ Winnow.add(:user,
   overflow: :truncate_end    # or :truncate_middle, default :error
 )
 ```
+
+Pieces above the threshold always fit in at least their cheapest form, so `:error` only raises
+(`Winnow.OversizedContentError`) when `:infinity`-priority pieces — including reservations — exceed
+the budget on their own.
 
 ### Merging
 
@@ -183,9 +187,9 @@ Built-in tokenizers:
 ## How It Works
 
 1. Each content piece has a **priority** (what to include) and **sequence** (output order)
-2. Binary search finds the highest priority **threshold** where included content fits the budget
+2. Binary search finds the lowest priority **threshold** where the pieces at or above it fit the budget in their cheapest form (smallest fallback, or truncated)
 3. Everything above the threshold is included; everything below is dropped
-4. Fallbacks are resolved greedily after the threshold is set
+4. Pieces are then resolved in priority order: each gets its primary, a fallback, or a truncation — whatever fits after reserving the minimum cost of the lower-priority pieces still to come. Spare room goes to the most important pieces first.
 5. Output is ordered by sequence, not priority
 
 ## Best Practices

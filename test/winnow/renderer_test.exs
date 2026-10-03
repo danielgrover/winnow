@@ -144,6 +144,16 @@ defmodule Winnow.RendererTest do
   end
 
   describe "render/1 — token counting" do
+    test "empty content costs nothing without an explicit token_count" do
+      result =
+        Winnow.new(budget: 100)
+        |> Winnow.add(:user, priority: 1, content: "")
+        |> Winnow.render()
+
+      assert result.total_tokens == 0
+      assert result.messages == []
+    end
+
     test "pre-computed token_count used when present" do
       result =
         Winnow.new(budget: 1000)
@@ -276,6 +286,49 @@ defmodule Winnow.RendererTest do
     end
   end
 
+  describe "property-based — mixed overflow modes" do
+    property "never raises and keeps every piece above threshold when reservations fit" do
+      check all(
+              budget <- integer(20..1000),
+              reserve <- integer(0..10),
+              pieces <- list_of(mixed_piece_generator(), min_length: 0, max_length: 20)
+            ) do
+        w =
+          Enum.reduce(pieces, Winnow.new(budget: budget), fn opts, acc ->
+            Winnow.add(acc, :user, opts)
+          end)
+          |> Winnow.reserve(:response, tokens: reserve)
+
+        result = Winnow.render(w)
+
+        assert result.total_tokens <= budget
+        assert Enum.any?(result.included, &(&1.name == :response))
+
+        # Only pieces below the threshold, truncatable pieces left with no
+        # room for content, or pieces resolved to an empty ("omit") fallback
+        # are dropped.
+        for piece <- result.dropped do
+          assert piece.priority < result.threshold or piece.overflow != :error or
+                   "" in piece.fallbacks
+        end
+
+        # Nothing "included" is invisible: every included piece that started
+        # with content produces a message, and empty pieces cost nothing.
+        originals = Map.new(w.pieces, &{&1.sequence, &1})
+
+        for piece <- result.included, piece.name != :response do
+          if originals[piece.sequence].content == "" do
+            assert piece.token_count == 0
+          else
+            assert piece.content != ""
+          end
+        end
+
+        assert length(result.included) + length(result.dropped) == length(w.pieces)
+      end
+    end
+  end
+
   describe "render/1 — fallbacks" do
     test "primary fits, no fallback used" do
       result =
@@ -398,11 +451,10 @@ defmodule Winnow.RendererTest do
   end
 
   describe "render/1 — overflow" do
-    test ":error raises OversizedContentError for piece above threshold that can't fit" do
-      # Piece A has a fallback, so binary search uses min_cost=5.
-      # But greedy pass uses A's primary (20) since it fits, leaving only 5 for B.
-      # B needs 12, can't fit, has overflow: :error → raises.
-      assert_raise Winnow.OversizedContentError, fn ->
+    test "piece above threshold never raises — earlier piece downgrades to fallback" do
+      # Min costs: A=5 (fallback), B=12 → 17 <= 25. A must use its fallback
+      # so B fits, rather than A taking its primary and B raising.
+      result =
         Winnow.new(budget: 25)
         |> Winnow.add(:user,
           priority: 500,
@@ -416,6 +468,25 @@ defmodule Winnow.RendererTest do
           token_count: 12,
           overflow: :error
         )
+        |> Winnow.render()
+
+      assert result.total_tokens <= 25
+      assert length(result.included) == 2
+      assert [{%{token_count: 20}, 0}] = result.fallbacks_used
+    end
+
+    test ":error raises when :infinity pieces alone exceed the budget" do
+      assert_raise Winnow.OversizedContentError, fn ->
+        Winnow.new(budget: 10)
+        |> Winnow.add(:system, priority: :infinity, content: "x", token_count: 20)
+        |> Winnow.render()
+      end
+    end
+
+    test "reservation larger than the budget raises instead of being dropped" do
+      assert_raise Winnow.OversizedContentError, ~r/:response/, fn ->
+        Winnow.new(budget: 100)
+        |> Winnow.reserve(:response, tokens: 500)
         |> Winnow.render()
       end
     end
@@ -515,6 +586,16 @@ defmodule Winnow.RendererTest do
   end
 
   describe "render/1 — conditions" do
+    test "nil-returning condition excludes the piece" do
+      result =
+        Winnow.new(budget: 100)
+        |> Winnow.add(:user, priority: 500, content: "Hidden", condition: fn -> nil end)
+        |> Winnow.render()
+
+      assert result.messages == []
+      assert [%{content: "Hidden"}] = result.condition_excluded
+    end
+
     test "true condition included" do
       result =
         Winnow.new(budget: 100)
@@ -988,23 +1069,40 @@ defmodule Winnow.RendererTest do
   end
 
   describe "render/1 — truncation edge cases" do
-    test "truncate with remaining = overhead exactly — empty content" do
+    test "truncate with remaining = overhead exactly — dropped, not included empty" do
       # Budget = 4 (just overhead for approximate tokenizer).
-      # Piece with truncate_end, large content. available_tokens = 4-4 = 0. max_bytes = 0.
+      # available_tokens = 4 - 4 = 0, so no content fits. The piece is reported
+      # as dropped rather than "included" with empty content and phantom tokens.
       result =
         Winnow.new(budget: 4)
         |> Winnow.add(:user,
           priority: 1000,
           content: String.duplicate("x", 100),
-          overflow: :truncate_end
+          overflow: :truncate_end,
+          metadata: {:story, 41}
         )
         |> Winnow.render()
 
-      # Truncated to empty content. token_count = count_tokens("") + overhead = 0 + 4 = 4.
-      assert result.total_tokens == 4
-      # Empty content piece gets excluded from messages by build_messages
+      assert result.total_tokens == 0
       assert result.messages == []
-      assert length(result.included) == 1
+      assert result.included == []
+      assert [%{metadata: {:story, 41}}] = result.dropped
+    end
+
+    test "truncate_middle never emits a bare marker" do
+      # 1 token of room (4 bytes) is less than the 7-byte marker plus content.
+      result =
+        Winnow.new(budget: 15)
+        |> Winnow.add(:system, priority: 100, content: "sys", token_count: 10)
+        |> Winnow.add(:user,
+          priority: 1,
+          content: String.duplicate("s", 400),
+          overflow: :truncate_middle
+        )
+        |> Winnow.render()
+
+      assert Enum.map(result.messages, & &1.content) == ["sys"]
+      assert [%{priority: 1}] = result.dropped
     end
 
     test "truncate_middle with content shorter than marker doesn't crash" do
@@ -1087,6 +1185,25 @@ defmodule Winnow.RendererTest do
   end
 
   describe "render/1 — section edge cases" do
+    test "section fallback not reported when main pass drops the piece" do
+      result =
+        Winnow.new(budget: 10)
+        |> Winnow.section(:memory, max_tokens: 10)
+        |> Winnow.add(:user,
+          priority: 10,
+          content: "big",
+          token_count: 20,
+          fallbacks: ["tiny"],
+          section: :memory
+        )
+        |> Winnow.add(:system, priority: 100, content: "sys", token_count: 10)
+        |> Winnow.render()
+
+      assert [%{content: "sys"}] = result.messages
+      assert [%{content: "tiny"}] = result.dropped
+      assert result.fallbacks_used == []
+    end
+
     test "section max_tokens > main budget — section respects its own budget" do
       result =
         Winnow.new(budget: 20)
@@ -1143,6 +1260,24 @@ defmodule Winnow.RendererTest do
   end
 
   describe "render/1 — fallback edge cases" do
+    test "empty-string fallback means omit — piece reported as dropped" do
+      result =
+        Winnow.new(budget: 14)
+        |> Winnow.add(:system, priority: 100, content: "sys", token_count: 10)
+        |> Winnow.add(:user,
+          priority: 1,
+          content: "long",
+          token_count: 50,
+          fallbacks: [String.duplicate("s", 40), ""]
+        )
+        |> Winnow.render()
+
+      assert Enum.map(result.messages, & &1.content) == ["sys"]
+      assert [%{content: "long"}] = result.dropped
+      assert result.fallbacks_used == []
+      assert result.total_tokens == 10
+    end
+
     test "fallback larger than primary — primary used since it fits" do
       result =
         Winnow.new(budget: 100)
@@ -1250,6 +1385,70 @@ defmodule Winnow.RendererTest do
     end
   end
 
+  describe "render/1 — greedy pass respects priority and pending minimums" do
+    test "truncatable piece before a reservation does not starve it" do
+      result =
+        Winnow.new(budget: 100)
+        |> Winnow.add(:user,
+          priority: 10,
+          content: String.duplicate("a", 800),
+          overflow: :truncate_end
+        )
+        |> Winnow.reserve(:response, tokens: 50)
+        |> Winnow.render()
+
+      assert result.total_tokens <= 100
+      assert Enum.any?(result.included, &(&1.name == :response))
+      assert result.dropped == []
+    end
+
+    test "low-priority earlier piece yields to high-priority later piece" do
+      result =
+        Winnow.new(budget: 100)
+        |> Winnow.add(:user,
+          priority: 10,
+          content: String.duplicate("b", 224),
+          fallbacks: ["short"]
+        )
+        |> Winnow.add(:user, priority: 20, content: String.duplicate("c", 224))
+        |> Winnow.render()
+
+      assert result.total_tokens <= 100
+      assert [_, %{content: "short"}] = result.included |> Enum.sort_by(&(-&1.priority))
+      assert [{%{priority: 10}, 0}] = result.fallbacks_used
+      # Output still ordered by sequence
+      assert [%{content: "short"}, _] = result.messages
+    end
+
+    test "high-priority truncatable piece leaves room for lower-priority fixed piece" do
+      fixed = String.duplicate("d", 64)
+
+      result =
+        Winnow.new(budget: 100)
+        |> Winnow.add(:user,
+          priority: 20,
+          content: String.duplicate("a", 800),
+          overflow: :truncate_end
+        )
+        |> Winnow.add(:user, priority: 10, content: fixed)
+        |> Winnow.render()
+
+      assert result.total_tokens == 100
+      assert Enum.any?(result.messages, &(&1.content == fixed))
+    end
+
+    test "spare budget upgrades the highest-priority piece first" do
+      # Both min costs are 5 (fallback "tiny"); budget only allows one primary.
+      result =
+        Winnow.new(budget: 30)
+        |> Winnow.add(:user, priority: 1, content: "low", token_count: 20, fallbacks: ["tiny"])
+        |> Winnow.add(:user, priority: 2, content: "high", token_count: 20, fallbacks: ["tiny"])
+        |> Winnow.render()
+
+      assert Enum.map(result.messages, & &1.content) == ["tiny", "high"]
+    end
+  end
+
   # Generators for property tests
 
   defp piece_generator do
@@ -1268,6 +1467,23 @@ defmodule Winnow.RendererTest do
             ])
         ) do
       {priority, String.duplicate("x", content_size), cacheable, fallback}
+    end
+  end
+
+  # Mixes :error pieces (with and without fallbacks) with truncatable ones.
+  defp mixed_piece_generator do
+    gen all(
+          priority <- integer(1..100),
+          content_size <- integer(0..400),
+          overflow <- member_of([:error, :truncate_end, :truncate_middle]),
+          fallbacks <- list_of(string(:alphanumeric, max_length: 40), max_length: 2)
+        ) do
+      [
+        priority: priority,
+        content: String.duplicate("x", content_size),
+        overflow: overflow,
+        fallbacks: fallbacks
+      ]
     end
   end
 

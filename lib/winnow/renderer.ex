@@ -5,12 +5,21 @@ defmodule Winnow.Renderer do
   Implements the priority-based binary search threshold algorithm
   inspired by Priompt/Cursor. The pipeline:
 
-  1. Compute token counts for all pieces
-  2. Gather unique priority levels, sort ascending
-  3. Binary search for the highest threshold where included tokens <= budget
-  4. Resolve fallbacks for included pieces that don't fit
-  5. Handle oversized content (error/truncate)
+  1. Evaluate conditions
+  2. Compute token counts for all pieces
+  3. Resolve sections within their own sub-budgets
+  4. Binary search for the lowest threshold where the pieces at or above it
+     fit the budget in their cheapest form (smallest fallback, or truncated
+     down to message overhead)
+  5. Greedy pass in priority order: each piece takes its primary, a
+     fallback, or a truncation — whatever fits after setting aside the
+     minimum cost of every lower-priority piece still pending
   6. Sort by sequence, build messages, populate RenderResult
+
+  Because of step 5's reservation, every piece above the threshold is
+  included — except a truncatable piece left with no room for any content,
+  which is reported as dropped. `Winnow.OversizedContentError` can only
+  occur when `:infinity`-priority pieces alone exceed the budget.
   """
 
   alias Winnow.ContentPiece
@@ -30,7 +39,7 @@ defmodule Winnow.Renderer do
     # Step 2: Compute token costs for each piece (primary and fallbacks)
     costed_pieces = compute_token_costs(pieces, tokenizer)
 
-    # Step 3: Render sections independently, replace with fixed-cost blocks
+    # Step 3: Render sections independently within their sub-budgets
     {main_pieces, section_dropped, section_fallbacks} =
       render_sections(costed_pieces, winnow.sections, tokenizer)
 
@@ -44,8 +53,15 @@ defmodule Winnow.Renderer do
     {final_included, extra_dropped, fallbacks_used} =
       resolve_fit(above_threshold, budget, tokenizer)
 
-    all_dropped = dropped ++ extra_dropped ++ section_dropped
-    all_fallbacks = fallbacks_used ++ section_fallbacks
+    main_dropped = dropped ++ extra_dropped
+    all_dropped = main_dropped ++ section_dropped
+
+    # A section piece that resolved to a fallback may still be dropped by
+    # the main pass; only report fallbacks whose result was kept.
+    all_fallbacks =
+      (section_fallbacks ++ fallbacks_used)
+      |> Enum.reject(fn {_original, _index, resolved} -> resolved in main_dropped end)
+      |> Enum.map(fn {original, index, _resolved} -> {original, index} end)
 
     # Sort included by sequence for output ordering
     final_included = Enum.sort_by(final_included, & &1.sequence)
@@ -141,7 +157,7 @@ defmodule Winnow.Renderer do
     # Truncatable pieces can fit in any remaining space (down to just overhead)
     case piece.overflow do
       overflow when overflow in [:truncate_end, :truncate_middle] ->
-        tokenizer.message_overhead()
+        min(piece.token_count, tokenizer.message_overhead())
 
       :error ->
         min_token_cost_with_fallbacks(piece, tokenizer)
@@ -174,7 +190,10 @@ defmodule Winnow.Renderer do
 
   # Render sections independently with their own sub-budgets.
   # Returns {main_pieces, section_dropped, section_fallbacks} where main_pieces
-  # contains non-sectioned pieces plus section results as fixed-cost blocks.
+  # contains non-sectioned pieces plus each section's surviving pieces, already
+  # resolved (fallback/truncation applied). Those pieces keep their priorities
+  # and compete individually in the main pass, which may drop or truncate them
+  # further.
   defp render_sections(pieces, sections, _tokenizer) when map_size(sections) == 0 do
     {pieces, [], []}
   end
@@ -214,74 +233,101 @@ defmodule Winnow.Renderer do
   end
 
   # Greedy post-threshold pass: resolve fallbacks and overflow.
-  # Pieces above the threshold are included if they fit. If a piece
-  # doesn't fit, try its fallbacks in order. If nothing fits, handle overflow.
+  #
+  # Pieces are visited in priority order (highest first, ties by sequence).
+  # Each piece may only consume what's left after setting aside the minimum
+  # cost of every piece still pending. Since the threshold guarantees the
+  # sum of minimum costs fits the budget, every piece above the threshold
+  # gets at least its cheapest form, and spare budget upgrades the most
+  # important pieces first (primary over fallback, longer truncation).
+  #
+  # Fallbacks are returned as `{original, index, resolved}` triples so the
+  # caller can discard entries whose resolved piece is dropped later.
   defp resolve_fit(pieces, budget, tokenizer) do
-    # Sort by sequence for deterministic greedy pass
-    sorted = Enum.sort_by(pieces, & &1.sequence)
+    costed =
+      pieces
+      |> Enum.map(&{&1, min_token_cost(&1, tokenizer)})
+      |> Enum.sort_by(fn {piece, _cost} -> fit_order_key(piece) end)
 
-    {included, dropped, fallbacks_used, _remaining} =
-      Enum.reduce(sorted, {[], [], [], budget}, fn piece, {inc, drop, fb, remaining} ->
-        if piece.token_count <= remaining do
-          # Primary fits
-          {[piece | inc], drop, fb, remaining - piece.token_count}
-        else
-          # Primary doesn't fit — try fallbacks
-          try_fallbacks(piece, remaining, tokenizer, inc, drop, fb)
+    pending = Enum.reduce(costed, 0, fn {_piece, cost}, acc -> acc + cost end)
+
+    {included, dropped, fallbacks_used, _remaining, _pending} =
+      Enum.reduce(costed, {[], [], [], budget, pending}, fn {piece, min_cost},
+                                                            {inc, drop, fb, remaining, pending} ->
+        pending = pending - min_cost
+        available = remaining - pending
+
+        case fit_piece(piece, available, tokenizer) do
+          {:included, resolved} ->
+            {[resolved | inc], drop, fb, remaining - resolved.token_count, pending}
+
+          {:fallback, resolved, index} ->
+            fb = [{piece, index, resolved} | fb]
+            {[resolved | inc], drop, fb, remaining - resolved.token_count, pending}
+
+          :dropped ->
+            {inc, [piece | drop], fb, remaining, pending}
         end
       end)
 
     {Enum.reverse(included), Enum.reverse(dropped), Enum.reverse(fallbacks_used)}
   end
 
-  defp try_fallbacks(piece, remaining, tokenizer, inc, drop, fb) do
+  defp fit_order_key(%{priority: :infinity, sequence: seq}), do: {0, 0, seq}
+  defp fit_order_key(%{priority: priority, sequence: seq}), do: {1, -priority, seq}
+
+  defp fit_piece(piece, available, tokenizer) do
+    if piece.token_count <= available do
+      {:included, piece}
+    else
+      try_fallbacks(piece, available, tokenizer)
+    end
+  end
+
+  defp try_fallbacks(piece, available, tokenizer) do
     result =
       piece.fallbacks
       |> Enum.with_index()
       |> Enum.find_value(fn {fallback_content, index} ->
         tokens = tokenizer.count_tokens(fallback_content) + tokenizer.message_overhead()
 
-        if tokens <= remaining do
-          {:ok, fallback_content, tokens, index}
+        if tokens <= available do
+          {fallback_content, tokens, index}
         end
       end)
 
     case result do
-      {:ok, content, tokens, index} ->
-        fallback_piece = %{piece | content: content, token_count: tokens, fallbacks: []}
-        {[fallback_piece | inc], drop, [{piece, index} | fb], remaining - tokens}
+      # An empty fallback means "omit": report the piece as dropped.
+      {"", _tokens, _index} ->
+        :dropped
+
+      {content, tokens, index} ->
+        {:fallback, %{piece | content: content, token_count: tokens, fallbacks: []}, index}
 
       nil ->
-        handle_overflow(piece, remaining, tokenizer, inc, drop, fb)
+        handle_overflow(piece, available, tokenizer)
     end
   end
 
-  defp handle_overflow(piece, remaining, tokenizer, inc, drop, fb) do
-    case piece.overflow do
-      :error ->
-        # Empty-content pieces (e.g. reservations that slipped through) are
-        # silently dropped rather than raising.
-        if piece.content != "" do
-          raise Winnow.OversizedContentError, piece: piece, remaining_budget: remaining
-        else
-          {inc, [piece | drop], fb, remaining}
-        end
-
-      mode when mode in [:truncate_end, :truncate_middle] ->
-        handle_truncation(piece, remaining, mode, tokenizer, inc, drop, fb)
-    end
+  # Only reachable when :infinity pieces alone exceed the budget (the
+  # threshold guarantees everything else gets at least its minimum cost).
+  defp handle_overflow(%{overflow: :error} = piece, available, _tokenizer) do
+    raise Winnow.OversizedContentError, piece: piece, remaining_budget: max(available, 0)
   end
 
-  defp handle_truncation(piece, remaining, mode, tokenizer, inc, drop, fb) do
-    overhead = tokenizer.message_overhead()
-
-    if remaining < overhead do
+  defp handle_overflow(piece, available, tokenizer) do
+    if available < tokenizer.message_overhead() do
       # Can't even fit message overhead — drop the piece
-      {inc, [piece | drop], fb, remaining}
+      :dropped
     else
-      truncate_mode = if mode == :truncate_end, do: :end, else: :middle
-      truncated = truncate_to_fit(piece, remaining, truncate_mode, tokenizer)
-      {[truncated | inc], drop, fb, remaining - truncated.token_count}
+      truncate_mode = if piece.overflow == :truncate_end, do: :end, else: :middle
+
+      case truncate_to_fit(piece, available, truncate_mode, tokenizer) do
+        # No room for any content — report as dropped rather than as an
+        # "included" piece that produces no message but still costs overhead.
+        %{content: ""} -> :dropped
+        truncated -> {:included, truncated}
+      end
     end
   end
 
@@ -331,7 +377,9 @@ defmodule Winnow.Renderer do
       half = div(usable, 2)
       prefix = truncate_bytes(original, half)
       suffix = truncate_bytes_from_end(original, half)
-      prefix <> marker <> suffix
+
+      # A bare marker carries no content; treat it as nothing fitting.
+      if prefix == "" and suffix == "", do: "", else: prefix <> marker <> suffix
     end
   end
 
@@ -378,14 +426,19 @@ defmodule Winnow.Renderer do
     |> elem(0)
   end
 
+  # Empty content produces no message, so it costs nothing unless the caller
+  # set token_count explicitly (as reservations do).
   defp compute_token_costs(pieces, tokenizer) do
-    Enum.map(pieces, fn piece ->
-      if piece.token_count do
+    Enum.map(pieces, fn
+      %{token_count: count} = piece when not is_nil(count) ->
         piece
-      else
+
+      %{content: ""} = piece ->
+        %{piece | token_count: 0}
+
+      piece ->
         tokens = tokenizer.count_tokens(piece.content) + tokenizer.message_overhead()
         %{piece | token_count: tokens}
-      end
     end)
   end
 
