@@ -107,6 +107,7 @@ defmodule Winnow do
   - `items` (required) — list of items to add
   - `formatter` (required) — `(item -> String.t())` function
   - `priority` or `priority_fn` (one required) — fixed integer or `(item, index) -> integer`
+  - `metadata_fn` — `(item -> term())` or `(item, index -> term())`; sets each piece's `metadata`
   - All other options from `add/3` are supported and applied to each piece
   """
   @spec add_each(t(), atom(), keyword()) :: t()
@@ -114,21 +115,34 @@ defmodule Winnow do
     items = Keyword.fetch!(opts, :items)
     formatter = Keyword.fetch!(opts, :formatter)
     priority_fn = priority_function(opts)
-    base_opts = Keyword.drop(opts, [:items, :formatter, :priority_fn])
+    metadata_fn = Keyword.get(opts, :metadata_fn)
+
+    unless is_nil(metadata_fn) or is_function(metadata_fn, 1) or is_function(metadata_fn, 2) do
+      raise ArgumentError,
+            "invalid metadata_fn: #{inspect(metadata_fn)}, must be a function of arity 1 or 2"
+    end
+
+    base_opts = Keyword.drop(opts, [:items, :formatter, :priority_fn, :metadata_fn])
 
     Enum.with_index(items)
     |> Enum.reduce(winnow, fn {item, index}, acc ->
-      content = formatter.(item)
-      priority = priority_fn.(item, index)
-
       piece_opts =
         base_opts
-        |> Keyword.put(:content, content)
-        |> Keyword.put(:priority, priority)
+        |> Keyword.put(:content, formatter.(item))
+        |> Keyword.put(:priority, priority_fn.(item, index))
+        |> put_metadata(metadata_fn, item, index)
 
       add(acc, role, piece_opts)
     end)
   end
+
+  defp put_metadata(opts, nil, _item, _index), do: opts
+
+  defp put_metadata(opts, fun, item, _index) when is_function(fun, 1),
+    do: Keyword.put(opts, :metadata, fun.(item))
+
+  defp put_metadata(opts, fun, item, index) when is_function(fun, 2),
+    do: Keyword.put(opts, :metadata, fun.(item, index))
 
   @doc """
   Adds tool definitions as content pieces with token costs.

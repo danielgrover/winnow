@@ -63,9 +63,13 @@ w
 w |> Winnow.add_each(:user,
   items: memory_items,
   priority_fn: fn _item, index -> 400 + index end,
-  formatter: fn item -> "Memory: #{item.content}" end
+  formatter: fn item -> "Memory: #{item.content}" end,
+  metadata_fn: &{:memory, &1.id}   # optional; arity 1 or 2 (item, index)
 )
 ```
+
+`metadata` (or `metadata_fn` here) is carried through to `result.included` and
+`result.dropped`, so you can tell which source items made the budget.
 
 **`Winnow.add_tools/3`** — add tool definitions as prioritized pieces.
 

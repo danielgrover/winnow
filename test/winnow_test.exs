@@ -92,6 +92,63 @@ defmodule WinnowTest do
   end
 
   describe "add_each/3" do
+    test "metadata_fn sets per-item metadata that survives render" do
+      items = [%{id: 1, text: "first"}, %{id: 2, text: "second"}]
+
+      result =
+        Winnow.new(budget: 4000)
+        |> Winnow.add_each(:user,
+          items: items,
+          priority: 500,
+          formatter: & &1.text,
+          metadata_fn: &{:story, &1.id}
+        )
+        |> Winnow.render()
+
+      assert Enum.map(result.included, & &1.metadata) == [{:story, 1}, {:story, 2}]
+    end
+
+    test "metadata_fn metadata is preserved on dropped pieces" do
+      result =
+        Winnow.new(budget: 10)
+        |> Winnow.add_each(:user,
+          items: [%{id: 1, text: "keep"}, %{id: 2, text: "drop"}],
+          priority_fn: fn _item, index -> 100 - index end,
+          formatter: & &1.text,
+          token_count: 10,
+          metadata_fn: &{:story, &1.id}
+        )
+        |> Winnow.render()
+
+      assert Enum.map(result.included, & &1.metadata) == [{:story, 1}]
+      assert Enum.map(result.dropped, & &1.metadata) == [{:story, 2}]
+    end
+
+    test "metadata_fn with wrong arity raises ArgumentError" do
+      assert_raise ArgumentError, ~r/invalid metadata_fn/, fn ->
+        Winnow.new(budget: 100)
+        |> Winnow.add_each(:user,
+          items: [1],
+          priority: 1,
+          formatter: &to_string/1,
+          metadata_fn: fn a, b, c -> {a, b, c} end
+        )
+      end
+    end
+
+    test "metadata_fn with arity 2 receives the index" do
+      w =
+        Winnow.new(budget: 4000)
+        |> Winnow.add_each(:user,
+          items: ["a", "b"],
+          priority: 500,
+          formatter: &Function.identity/1,
+          metadata_fn: fn item, index -> {item, index} end
+        )
+
+      assert Enum.map(w.pieces, & &1.metadata) == [{"a", 0}, {"b", 1}]
+    end
+
     test "adds one piece per item with fixed priority" do
       items = ["alpha", "beta", "gamma"]
 
