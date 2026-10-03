@@ -45,7 +45,7 @@ defmodule Winnow.Tokenizer.TiktokenTest do
 
       assert result.total_tokens > 0
       assert result.total_tokens <= 100
-      assert length(result.messages) == 2
+      assert [_, _] = result.messages
     end
   end
 end

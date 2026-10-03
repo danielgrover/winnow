@@ -160,7 +160,7 @@ defmodule WinnowTest do
           formatter: &Function.identity/1
         )
 
-      assert length(w.pieces) == 3
+      assert [_, _, _] = w.pieces
 
       contents = Enum.map(w.pieces, & &1.content)
       assert contents == ["alpha", "beta", "gamma"]
@@ -223,7 +223,7 @@ defmodule WinnowTest do
         Winnow.new(budget: 4000)
         |> Winnow.add_tools(tools, priority: 750)
 
-      assert length(w.pieces) == 2
+      assert [_, _] = w.pieces
 
       assert Enum.all?(w.pieces, &(&1.role == :system))
       assert Enum.all?(w.pieces, &(&1.type == :tool_def))
@@ -295,7 +295,7 @@ defmodule WinnowTest do
         )
         |> Winnow.reserve(:response, tokens: 1000)
 
-      assert length(w.pieces) == 6
+      assert [_, _, _, _, _, _] = w.pieces
       sequences = Enum.map(w.pieces, & &1.sequence)
       assert sequences == [0, 1, 2, 3, 4, 5]
     end
@@ -322,7 +322,7 @@ defmodule WinnowTest do
           formatter: &Function.identity/1
         )
 
-      assert length(w.pieces) == 1
+      assert [_] = w.pieces
       assert hd(w.pieces).content == "only"
       assert hd(w.pieces).priority == 500
     end
@@ -337,7 +337,7 @@ defmodule WinnowTest do
         |> Winnow.render()
 
       # Reserve piece is included but has empty content → excluded from messages
-      assert length(result.messages) == 1
+      assert [_] = result.messages
       assert hd(result.messages).content == "Hello"
       # But it's in included
       reserve_piece = Enum.find(result.included, &(&1.name == :response))
@@ -358,7 +358,7 @@ defmodule WinnowTest do
 
       merged = Winnow.merge(left, right)
 
-      assert length(merged.pieces) == 2
+      assert [_, _] = merged.pieces
       contents = Enum.map(merged.pieces, & &1.content)
       assert contents == ["Left", "Right"]
     end
@@ -429,7 +429,7 @@ defmodule WinnowTest do
 
       merged = Winnow.merge(left, right)
 
-      assert length(merged.pieces) == 1
+      assert [_] = merged.pieces
       assert hd(merged.pieces).content == "A"
     end
 

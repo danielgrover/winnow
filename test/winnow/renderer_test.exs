@@ -99,7 +99,7 @@ defmodule Winnow.RendererTest do
 
       assert [%{role: :system, content: "Hello"}] = result.messages
       assert result.total_tokens == 10
-      assert length(result.included) == 1
+      assert [_] = result.included
       assert result.dropped == []
     end
 
@@ -110,11 +110,11 @@ defmodule Winnow.RendererTest do
         |> Winnow.add(:user, priority: 100, content: "Less important", token_count: 10)
         |> Winnow.render()
 
-      assert length(result.messages) == 1
+      assert [_] = result.messages
       assert [%{role: :system, content: "Important"}] = result.messages
       assert result.total_tokens == 10
-      assert length(result.included) == 1
-      assert length(result.dropped) == 1
+      assert [_] = result.included
+      assert [_] = result.dropped
       assert hd(result.dropped).priority == 100
     end
 
@@ -186,8 +186,8 @@ defmodule Winnow.RendererTest do
       assert result.budget == 20
       assert result.total_tokens == 20
       assert result.threshold == 500
-      assert length(result.included) == 2
-      assert length(result.dropped) == 1
+      assert [_, _] = result.included
+      assert [_] = result.dropped
 
       included_priorities = Enum.map(result.included, & &1.priority)
       assert Enum.all?(included_priorities, &(&1 >= result.threshold))
@@ -208,7 +208,7 @@ defmodule Winnow.RendererTest do
 
       # Budget 20, reserve 10, only room for A (10). B is dropped.
       assert result.total_tokens == 20
-      assert length(result.messages) == 1
+      assert [_] = result.messages
       assert hd(result.messages).content == "A"
     end
   end
@@ -360,7 +360,7 @@ defmodule Winnow.RendererTest do
       contents = Enum.map(result.messages, & &1.content)
       assert "Short" in contents
       refute "Very long primary content" in contents
-      assert length(result.fallbacks_used) == 1
+      assert [_] = result.fallbacks_used
       {_original_piece, index} = hd(result.fallbacks_used)
       assert index == 0
     end
@@ -405,7 +405,7 @@ defmodule Winnow.RendererTest do
 
       # A's primary fits (20 <= 25), uses primary. Remaining=5.
       # B primary=12>5, fallback too large, empty content → dropped.
-      assert length(result.messages) == 1
+      assert [_] = result.messages
     end
 
     test "fallback preserves role and sequence" do
@@ -471,7 +471,7 @@ defmodule Winnow.RendererTest do
         |> Winnow.render()
 
       assert result.total_tokens <= 25
-      assert length(result.included) == 2
+      assert [_, _] = result.included
       assert [{%{token_count: 20}, 0}] = result.fallbacks_used
     end
 
@@ -504,7 +504,7 @@ defmodule Winnow.RendererTest do
         |> Winnow.render()
 
       assert result.total_tokens <= 30
-      assert length(result.messages) == 1
+      assert [_] = result.messages
       assert byte_size(hd(result.messages).content) < 200
     end
 
@@ -639,7 +639,7 @@ defmodule Winnow.RendererTest do
         |> Winnow.add(:user, priority: 500, content: "Visible", token_count: 10)
         |> Winnow.render()
 
-      assert length(result.condition_excluded) == 1
+      assert [_] = result.condition_excluded
       assert hd(result.condition_excluded).content == "Hidden"
     end
 
@@ -814,7 +814,7 @@ defmodule Winnow.RendererTest do
         |> Winnow.add_tools(tools, priority: 750)
         |> Winnow.render()
 
-      assert length(result.tools) == 2
+      assert [_, _] = result.tools
       names = Enum.map(result.tools, & &1.name)
       assert "search" in names
       assert "weather" in names
@@ -979,7 +979,7 @@ defmodule Winnow.RendererTest do
 
       # Reserve has empty content, not in messages. Breakpoint is index 0 (Hello).
       assert result.cache_breakpoint == 0
-      assert length(result.messages) == 2
+      assert [_, _] = result.messages
     end
 
     test "non-contiguous cacheable pieces — breakpoint at last cacheable message" do
@@ -1031,7 +1031,7 @@ defmodule Winnow.RendererTest do
         |> Winnow.render()
 
       assert result.total_tokens <= 20
-      assert length(result.included) == 2
+      assert [_, _] = result.included
       # B used fallback
       assert result.fallbacks_used != []
       {fb_piece, _idx} = hd(result.fallbacks_used)
@@ -1061,8 +1061,8 @@ defmodule Winnow.RendererTest do
         |> Winnow.render()
 
       assert result.total_tokens == 19
-      assert length(result.included) == 2
-      assert length(result.fallbacks_used) == 1
+      assert [_, _] = result.included
+      assert [_] = result.fallbacks_used
       {fb_piece, 0} = hd(result.fallbacks_used)
       assert fb_piece.content == String.duplicate("b", 40)
     end
@@ -1108,7 +1108,7 @@ defmodule Winnow.RendererTest do
     test "truncate_middle with content shorter than marker doesn't crash" do
       # Content "ab" = 2 bytes. Marker " [...] " = 7 bytes.
       # Budget allows ~3 tokens content + 4 overhead = ~16 budget needed for full content.
-      # Let's force truncation by setting budget low.
+      # Budget 5 forces truncation.
       result =
         Winnow.new(budget: 5)
         |> Winnow.add(:user,
@@ -1137,9 +1137,9 @@ defmodule Winnow.RendererTest do
         |> Winnow.render()
 
       assert result.total_tokens == 10
-      assert length(result.included) == 1
+      assert [_] = result.included
       assert hd(result.included).name == :response
-      assert length(result.dropped) == 1
+      assert [_] = result.dropped
     end
   end
 
@@ -1152,7 +1152,7 @@ defmodule Winnow.RendererTest do
         |> Winnow.render()
 
       assert result.threshold == 0
-      assert length(result.included) == 2
+      assert [_, _] = result.included
       assert result.dropped == []
     end
 
@@ -1313,7 +1313,7 @@ defmodule Winnow.RendererTest do
       # Remaining after Sys = 5. Primary=50, fb0=large, fb1="ok"=div(2,4)+4=4+1=5, fits!
       contents = Enum.map(result.messages, & &1.content)
       assert "ok" in contents
-      assert length(result.fallbacks_used) == 1
+      assert [_] = result.fallbacks_used
       {_piece, index} = hd(result.fallbacks_used)
       assert index == 1
     end
