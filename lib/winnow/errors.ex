@@ -23,12 +23,18 @@ defmodule Winnow.OversizedContentError do
 
     msg =
       "Content piece (#{name}priority: #{inspect(piece.priority)}, tokens: #{piece.token_count}) " <>
-        "exceeds remaining budget of #{remaining} tokens#{scope}. " <> hint(piece)
+        "exceeds the #{remaining} tokens available to it#{scope} after setting aside " <>
+        "the other :infinity pieces. " <> hint(piece)
 
     %__MODULE__{message: msg, piece: piece, remaining_budget: remaining, section: section}
   end
 
-  # Reservations have no content to truncate; the budget itself is too small.
-  defp hint(%{content: ""}), do: "Increase the budget or reduce the reservation."
-  defp hint(_piece), do: "Set overflow: :truncate_end or :truncate_middle to auto-truncate."
+  # Empty pieces (e.g. reservations) have no content to truncate; only the
+  # budget or the piece's token_count can change.
+  defp hint(%{content: ""}), do: "Increase the budget or lower the piece's token_count."
+
+  defp hint(%{overflow: :error}),
+    do: "Set overflow: :truncate_end or :truncate_middle to auto-truncate."
+
+  defp hint(_piece), do: "Even its smallest truncation doesn't fit; increase the budget."
 end

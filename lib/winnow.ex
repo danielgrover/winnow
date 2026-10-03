@@ -22,6 +22,22 @@ defmodule Winnow do
 
   alias Winnow.ContentPiece
 
+  # Options add/3 accepts (ContentPiece fields minus the role argument).
+  @piece_options [
+    :priority,
+    :content,
+    :sequence,
+    :token_count,
+    :fallbacks,
+    :section,
+    :cacheable,
+    :type,
+    :condition,
+    :overflow,
+    :name,
+    :metadata
+  ]
+
   @type t :: %__MODULE__{
           budget: non_neg_integer(),
           tokenizer: module(),
@@ -48,6 +64,7 @@ defmodule Winnow do
   """
   @spec new(keyword()) :: t()
   def new(opts) do
+    opts = validate_opts!(opts, [:budget, :tokenizer], [:budget])
     budget = Keyword.fetch!(opts, :budget)
     tokenizer = Keyword.get(opts, :tokenizer, Winnow.Tokenizer.Approximate)
 
@@ -81,9 +98,7 @@ defmodule Winnow do
   """
   @spec add(t(), atom(), keyword()) :: t()
   def add(%__MODULE__{} = winnow, role, opts) do
-    _ = Keyword.fetch!(opts, :priority)
-    _ = Keyword.fetch!(opts, :content)
-
+    opts = validate_opts!(opts, @piece_options, [:priority, :content])
     {sequence, winnow} = next_sequence(winnow, opts)
 
     piece_attrs =
@@ -114,10 +129,25 @@ defmodule Winnow do
   """
   @spec add_each(t(), atom(), keyword()) :: t()
   def add_each(%__MODULE__{} = winnow, role, opts) do
+    # :content comes from the formatter and :sequence must differ per item,
+    # so neither can be set for the whole batch.
+    allowed = [
+      :items,
+      :formatter,
+      :priority_fn,
+      :metadata_fn | @piece_options -- [:content, :sequence]
+    ]
+
+    opts = validate_opts!(opts, allowed, [:items, :formatter])
     items = Keyword.fetch!(opts, :items)
     formatter = Keyword.fetch!(opts, :formatter)
     priority_fn = priority_function(opts)
     metadata_fn = Keyword.get(opts, :metadata_fn)
+
+    unless is_function(formatter, 1) do
+      raise ArgumentError,
+            "invalid formatter: #{inspect(formatter)}, must be a function of arity 1"
+    end
 
     unless is_nil(metadata_fn) or is_function(metadata_fn, 1) or is_function(metadata_fn, 2) do
       raise ArgumentError,
@@ -151,28 +181,33 @@ defmodule Winnow do
   @doc """
   Adds tool definitions as content pieces with token costs.
 
-  Tools are added as pieces with role `:system` and type `:tool_def`.
-  The content is the tool's description, and token_count should reflect
-  the full tool definition cost.
+  Each tool becomes a `:system` piece of type `:tool_def` whose `metadata`
+  is the tool map. Included tools are returned in `RenderResult.tools` (not
+  in `messages`). By default a tool's cost is estimated from its full
+  definition (`inspect/1` of the map, including any parameter schema); pass
+  `token_count` when you know the real cost.
 
   ## Options
 
   - `priority` (required) — integer priority for the tool definitions
-  - `token_count` — override token count per tool (useful for known costs)
+  - `token_count` — token cost per tool (applies to every tool in this call)
+  - `section`, `cacheable`, `condition`, `name` — as in `add/3`
+  - `fallbacks` — only `[""]` (omit), since a tool is sent whole or not at all
   """
   @spec add_tools(t(), [map()], keyword()) :: t()
   def add_tools(%__MODULE__{} = winnow, tools, opts) do
-    priority = Keyword.fetch!(opts, :priority)
-    base_opts = Keyword.drop(opts, [:priority])
+    allowed = [:priority, :token_count, :section, :cacheable, :condition, :name, :fallbacks]
+    opts = validate_opts!(opts, allowed, [:priority])
 
-    Enum.reduce(tools, winnow, fn tool, acc ->
-      content = tool_content(tool)
+    Enum.reduce(tools, winnow, fn
+      tool, acc when is_map(tool) ->
+        piece_opts =
+          Keyword.merge(opts, content: tool_content(tool), type: :tool_def, metadata: tool)
 
-      piece_opts =
-        [priority: priority, content: content, type: :tool_def, metadata: tool]
-        |> Keyword.merge(base_opts)
+        add(acc, :system, piece_opts)
 
-      add(acc, :system, piece_opts)
+      tool, _acc ->
+        raise ArgumentError, "invalid tool: #{inspect(tool)}, must be a map"
     end)
   end
 
@@ -189,6 +224,7 @@ defmodule Winnow do
   """
   @spec reserve(t(), atom(), keyword()) :: t()
   def reserve(%__MODULE__{} = winnow, name, opts) do
+    opts = validate_opts!(opts, [:tokens], [:tokens])
     tokens = Keyword.fetch!(opts, :tokens)
     validate_non_neg_integer!(:tokens, tokens)
 
@@ -215,6 +251,7 @@ defmodule Winnow do
   """
   @spec section(t(), atom(), keyword()) :: t()
   def section(%__MODULE__{} = winnow, name, opts) do
+    opts = validate_opts!(opts, [:max_tokens], [:max_tokens])
     max_tokens = Keyword.fetch!(opts, :max_tokens)
     validate_non_neg_integer!(:max_tokens, max_tokens)
 
@@ -292,6 +329,24 @@ defmodule Winnow do
     end
   end
 
+  # Options must be a keyword list with only known keys and all required
+  # keys present; anything else is an ArgumentError naming the problem.
+  defp validate_opts!(opts, allowed, required) do
+    unless Keyword.keyword?(opts) do
+      raise ArgumentError, "expected a keyword list of options, got: #{inspect(opts)}"
+    end
+
+    case Keyword.keys(opts) -- allowed do
+      [] -> :ok
+      unknown -> raise ArgumentError, "unknown option(s) #{inspect(Enum.uniq(unknown))}"
+    end
+
+    case required -- Keyword.keys(opts) do
+      [] -> opts
+      missing -> raise ArgumentError, "missing required option(s) #{inspect(missing)}"
+    end
+  end
+
   defp validate_non_neg_integer!(_key, value) when is_integer(value) and value >= 0, do: :ok
 
   defp validate_non_neg_integer!(key, value) do
@@ -310,20 +365,24 @@ defmodule Winnow do
   end
 
   defp priority_function(opts) do
-    cond do
-      Keyword.has_key?(opts, :priority_fn) ->
-        Keyword.fetch!(opts, :priority_fn)
+    case {Keyword.fetch(opts, :priority_fn), Keyword.fetch(opts, :priority)} do
+      {{:ok, _}, {:ok, _}} ->
+        raise ArgumentError, "provide either :priority or :priority_fn, not both"
 
-      Keyword.has_key?(opts, :priority) ->
-        priority = Keyword.fetch!(opts, :priority)
+      {{:ok, fun}, :error} when is_function(fun, 2) ->
+        fun
+
+      {{:ok, fun}, :error} ->
+        raise ArgumentError, "invalid priority_fn: #{inspect(fun)}, must be a function of arity 2"
+
+      {:error, {:ok, priority}} ->
         fn _item, _index -> priority end
 
-      true ->
+      {:error, :error} ->
         raise ArgumentError, "must provide either :priority or :priority_fn"
     end
   end
 
-  defp tool_content(%{name: name, description: desc}), do: "#{name}: #{desc}"
-  defp tool_content(%{"name" => name, "description" => desc}), do: "#{name}: #{desc}"
-  defp tool_content(tool) when is_map(tool), do: inspect(tool)
+  # Cost basis for a tool: its whole definition, schema included.
+  defp tool_content(tool), do: inspect(tool, limit: :infinity, printable_limit: :infinity)
 end

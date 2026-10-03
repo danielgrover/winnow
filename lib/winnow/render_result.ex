@@ -7,20 +7,27 @@ defmodule Winnow.RenderResult do
 
   ## Fields
 
-  - `messages` — ordered list of `%{role: atom, content: String.t()}` maps
-  - `tools` — list of tool definition maps
-  - `total_tokens` — tokens consumed by included content
+  - `messages` — ordered list of `%{role: atom, content: String.t()}` maps.
+    Excludes reservations (empty content) and tool definitions.
+  - `tools` — metadata (the tool map) of each included `:tool_def` piece
+  - `total_tokens` — tokens consumed by included pieces, including reservations
+    and tool definitions (so it can exceed what `messages` alone cost)
   - `budget` — the original token budget
-  - `threshold` — the computed priority threshold
-  - `included` — list of `ContentPiece` structs that made the cut
-  - `dropped` — list of `ContentPiece` structs that didn't fit
-  - `fallbacks_used` — list of `{ContentPiece, fallback_index}` tuples
+  - `threshold` — the computed priority threshold: pieces with priority at or
+    above it were eligible. When no finite-priority piece fits, it is one
+    above the highest priority present; when there are no finite-priority
+    pieces at all (only `:infinity`, or nothing), it is `0`.
+  - `included` — `ContentPiece` structs that made the cut, as rendered (content
+    may be a fallback or truncated; `token_count` is the actual cost)
+  - `dropped` — `ContentPiece` structs that didn't fit, in their original form
+  - `fallbacks_used` — `{original_piece, fallback_index}` for each included
+    piece rendered from a fallback
   - `cache_breakpoint` — index into `messages` of the last message derived from
     a piece with `cacheable: true`, or `nil` if no cacheable pieces are included.
     Use this to place Anthropic's `cache_control` marker.
-  - `condition_excluded` — list of `ContentPiece` structs excluded by their
-    `condition` function returning `false`. These are neither in `included` nor
-    `dropped`; they were removed before the priority/budget pass.
+  - `condition_excluded` — `ContentPiece` structs excluded because their
+    `condition` returned a falsy value (`false` or `nil`). These are neither in
+    `included` nor `dropped`; they were removed before the priority/budget pass.
 
   ## Example
 

@@ -98,13 +98,16 @@ Returns a `Winnow.RenderResult` with:
 - `threshold` — computed priority cutoff
 - `included` / `dropped` — which pieces made it and which didn't
 - `fallbacks_used` — pieces where a fallback was used
+- `tools` — tool definitions (from `add_tools/3`) that made the budget; these are
+  not repeated in `messages`
 
 ### Fallbacks
 
 Provide alternative content for when the primary doesn't fit:
 
 ```elixir
-Winnow.add(:user,
+w
+|> Winnow.add(:user,
   priority: 500,
   content: full_document,
   fallbacks: [summary, one_liner]
@@ -130,7 +133,8 @@ Pieces within a section compete against each other within the section's budget. 
 Include pieces conditionally at render time:
 
 ```elixir
-Winnow.add(:user,
+w
+|> Winnow.add(:user,
   priority: 500,
   content: challenge_context,
   condition: fn -> challenge != nil end
@@ -142,7 +146,8 @@ Winnow.add(:user,
 Control what happens when a piece is too large:
 
 ```elixir
-Winnow.add(:user,
+w
+|> Winnow.add(:user,
   priority: 500,
   content: huge_document,
   overflow: :truncate_end    # or :truncate_middle, default :error
@@ -192,9 +197,9 @@ Built-in tokenizers:
 ## How It Works
 
 1. Each content piece has a **priority** (what to include) and **sequence** (output order)
-2. Binary search finds the lowest priority **threshold** where the pieces at or above it fit the budget in their cheapest form (smallest fallback, or truncated)
-3. Everything above the threshold is included; everything below is dropped
-4. Pieces are then resolved in priority order: each gets its primary, a fallback, or a truncation — whatever fits after reserving the minimum cost of the lower-priority pieces still to come. Spare room goes to the most important pieces first.
+2. Priority levels are admitted from highest to lowest while the pieces fit the budget in their cheapest form (smallest fallback, or smallest truncation). The lowest admitted level is the **threshold**; everything below is dropped. A piece with a `""` (omit) fallback that doesn't fit is skipped without blocking lower levels.
+3. Every admitted piece is included with real content
+4. Pieces are then resolved in priority order: each gets its primary, a fallback, or a truncation — whatever fits after reserving the minimum cost of the pieces still to come. Spare room goes to the most important pieces first.
 5. Output is ordered by sequence, not priority
 
 ## Best Practices
@@ -211,7 +216,7 @@ Winnow draws from several systems and ideas in the prompt engineering ecosystem:
 
 - **[Priompt](https://github.com/anysphere/priompt)** (Anysphere/Cursor) — the priority-based threshold algorithm, binary search for budget fitting, and fallback mechanism that form Winnow's core render pipeline
 - **Anthropic's prompt engineering patterns** — the 4-block prompt structure (Instructions, Context, Task, Output Format) informed how priorities map to prompt sections
-- **[vscode-prompt-tsx](https://github.com/nicklascschmidt/vscode-prompt-tsx)** (Microsoft) — priority-based pruning in VS Code Copilot validated this approach for production use
+- **[vscode-prompt-tsx](https://github.com/microsoft/vscode-prompt-tsx)** (Microsoft) — priority-based pruning in VS Code Copilot validated this approach for production use
 - **[LangChain](https://github.com/langchain-ai/langchain)** — memory management categories (buffer/summary/hybrid) informed what Winnow deliberately does *not* handle: content generation and summarization live upstream
 
 Adapted for Elixir's data-driven style — structs and pure functions instead of JSX or class hierarchies.

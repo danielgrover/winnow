@@ -83,7 +83,8 @@ defmodule Winnow.ContentPiece do
   end
 
   def new(attrs) when is_map(attrs) do
-    with :ok <- validate_required(attrs),
+    with :ok <- validate_known_keys(attrs),
+         :ok <- validate_required(attrs),
          :ok <- validate_role(attrs),
          :ok <- validate_priority(attrs),
          :ok <- validate_sequence(attrs),
@@ -114,6 +115,29 @@ defmodule Winnow.ContentPiece do
     case new(attrs) do
       {:ok, piece} -> piece
       {:error, reason} -> raise ArgumentError, reason
+    end
+  end
+
+  @known_keys MapSet.new([
+                :role,
+                :content,
+                :priority,
+                :sequence,
+                :token_count,
+                :section,
+                :condition,
+                :name,
+                :metadata,
+                :fallbacks,
+                :cacheable,
+                :type,
+                :overflow
+              ])
+
+  defp validate_known_keys(attrs) do
+    case attrs |> Map.keys() |> Enum.reject(&MapSet.member?(@known_keys, &1)) do
+      [] -> :ok
+      unknown -> {:error, "unknown field(s): #{inspect(unknown)}"}
     end
   end
 

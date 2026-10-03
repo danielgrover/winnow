@@ -141,6 +141,11 @@ defmodule Winnow.ContentPieceTest do
       assert {:ok, _} = ContentPiece.new(Map.put(tool, :fallbacks, [""]))
     end
 
+    test "unknown fields return an error instead of raising" do
+      assert {:error, msg} = ContentPiece.new(Map.put(@valid_attrs, :bogus, 1))
+      assert msg =~ "unknown field(s): [:bogus]"
+    end
+
     test "accepts valid optional fields" do
       attrs =
         Map.merge(@valid_attrs, %{

@@ -16,7 +16,7 @@ defmodule WinnowTest do
     end
 
     test "raises without budget" do
-      assert_raise KeyError, fn ->
+      assert_raise ArgumentError, ~r/missing required option\(s\) \[:budget\]/, fn ->
         Winnow.new([])
       end
     end
@@ -79,13 +79,13 @@ defmodule WinnowTest do
     end
 
     test "raises on missing priority" do
-      assert_raise KeyError, fn ->
+      assert_raise ArgumentError, ~r/missing required option\(s\) \[:priority\]/, fn ->
         Winnow.new(budget: 4000) |> Winnow.add(:user, content: "X")
       end
     end
 
     test "raises on missing content" do
-      assert_raise KeyError, fn ->
+      assert_raise ArgumentError, ~r/missing required option\(s\) \[:content\]/, fn ->
         Winnow.new(budget: 4000) |> Winnow.add(:user, priority: 500)
       end
     end
@@ -229,8 +229,11 @@ defmodule WinnowTest do
       assert Enum.all?(w.pieces, &(&1.type == :tool_def))
 
       [first, second] = w.pieces
-      assert first.content == "get_weather: Get weather for a location"
-      assert second.content == "search: Search the web"
+      # Cost basis is the whole definition
+      assert first.content =~ "get_weather"
+      assert first.content =~ "Get weather for a location"
+      assert second.content =~ "search"
+      assert second.content =~ "Search the web"
     end
 
     test "supports string-keyed tool maps" do
@@ -241,7 +244,8 @@ defmodule WinnowTest do
         |> Winnow.add_tools(tools, priority: 500)
 
       [piece] = w.pieces
-      assert piece.content == "foo: does foo"
+      assert piece.content =~ ~s("name" => "foo")
+      assert piece.content =~ ~s("description" => "does foo")
     end
 
     test "stores original tool map in metadata" do
@@ -610,12 +614,94 @@ defmodule WinnowTest do
 
   describe "add_tools/3 validation" do
     test "rejects truncation for tool definitions" do
-      assert_raise ArgumentError, ~r/can't be truncated/, fn ->
+      assert_raise ArgumentError, ~r/unknown option\(s\) \[:overflow\]/, fn ->
         Winnow.new(budget: 100)
         |> Winnow.add_tools([%{name: "search", description: "Search"}],
           priority: 1,
           overflow: :truncate_end
         )
+      end
+    end
+  end
+
+  describe "add_tools/3 owns its tool fields" do
+    @tool %{name: "search", description: "Search the web", parameters: %{q: "string"}}
+
+    test "tools are returned in tools, not duplicated into messages" do
+      result =
+        Winnow.new(budget: 1000)
+        |> Winnow.add(:system, priority: 1000, content: "You are helpful.", cacheable: true)
+        |> Winnow.add_tools([@tool], priority: 750)
+        |> Winnow.render()
+
+      assert result.tools == [@tool]
+      assert Enum.map(result.messages, & &1.content) == ["You are helpful."]
+      assert result.cache_breakpoint == 0
+    end
+
+    test "default cost covers the parameter schema" do
+      w = Winnow.new(budget: 1000) |> Winnow.add_tools([@tool], priority: 750)
+      assert hd(w.pieces).content =~ "parameters"
+    end
+
+    test "rejects options that would override the tool's own fields" do
+      for opt <- [metadata: :mine, type: :text, content: "X", overflow: :truncate_end] do
+        assert_raise ArgumentError, ~r/unknown option/, fn ->
+          Winnow.new(budget: 1000) |> Winnow.add_tools([@tool], [{:priority, 1}, opt])
+        end
+      end
+    end
+
+    test "rejects non-map tools" do
+      assert_raise ArgumentError, ~r/invalid tool/, fn ->
+        Winnow.new(budget: 1000) |> Winnow.add_tools(["x"], priority: 1)
+      end
+    end
+  end
+
+  describe "option validation" do
+    test "unknown options raise ArgumentError naming them" do
+      w = Winnow.new(budget: 100)
+
+      assert_raise ArgumentError, ~r/unknown option\(s\) \[:fallback\]/, fn ->
+        Winnow.add(w, :user, priority: 1, content: "x", fallback: ["typo"])
+      end
+
+      assert_raise ArgumentError, ~r/unknown option\(s\) \[:budgt\]/, fn ->
+        Winnow.new(budgt: 100, budget: 100)
+      end
+
+      assert_raise ArgumentError, ~r/unknown option\(s\) \[:section\]/, fn ->
+        Winnow.reserve(w, :response, tokens: 5, section: :s)
+      end
+    end
+
+    test "maps instead of keyword lists raise ArgumentError" do
+      assert_raise ArgumentError, ~r/expected a keyword list/, fn ->
+        # apply/3 keeps the type checker from flagging this deliberately bad call
+        # credo:disable-for-next-line Credo.Check.Refactor.Apply
+        apply(Winnow, :new, [%{budget: 10}])
+      end
+    end
+
+    test "add_each rejects conflicting or per-batch-meaningless options" do
+      w = Winnow.new(budget: 100)
+      base = [items: [1, 2], formatter: &to_string/1]
+
+      assert_raise ArgumentError, ~r/not both/, fn ->
+        Winnow.add_each(w, :user, base ++ [priority: 1, priority_fn: fn _, _ -> 1 end])
+      end
+
+      assert_raise ArgumentError, ~r/unknown option\(s\) \[:sequence\]/, fn ->
+        Winnow.add_each(w, :user, base ++ [priority: 1, sequence: 5])
+      end
+
+      assert_raise ArgumentError, ~r/invalid priority_fn/, fn ->
+        Winnow.add_each(w, :user, base ++ [priority_fn: fn _ -> 1 end])
+      end
+
+      assert_raise ArgumentError, ~r/invalid formatter/, fn ->
+        Winnow.add_each(w, :user, items: [1], formatter: "nope", priority: 1)
       end
     end
   end
